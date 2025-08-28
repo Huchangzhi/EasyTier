@@ -154,3 +154,4 @@ jobs:
       - name: Mark result as failed
         if: needs.build-mobile.result != 'success'
         run: exit 1
+
