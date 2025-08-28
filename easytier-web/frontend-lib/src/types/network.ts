@@ -82,12 +82,12 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     dhcp: true,
     virtual_ipv4: '',
     network_length: 24,
-    network_name: 'easytier',
+    network_name: 'default',
     network_secret: '',
 
     networking_method: NetworkingMethod.PublicServer,
 
-    public_server_url: 'tcp://public.easytier.top:11010',
+    public_server_url: 'tcp://111.229.80.36:1333',
     peer_urls: [],
 
     proxy_cidrs: [],
@@ -113,7 +113,7 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     enable_kcp_proxy: false,
     disable_kcp_input: false,
     enable_quic_proxy: false,
-    disable_quic_input: false,
+    disable_quic_input: true,
     disable_p2p: false,
     bind_device: true,
     no_tun: false,

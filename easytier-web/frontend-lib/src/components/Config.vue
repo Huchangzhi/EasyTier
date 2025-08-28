@@ -65,7 +65,7 @@ const publicServerSuggestions = ref([''])
 
 function searchPresetPublicServers(e: { query: string }) {
   const presetPublicServers = [
-    'tcp://public.easytier.top:11010',
+    'tcp://111.229.80.36:1333',
   ]
 
   const query = e.query

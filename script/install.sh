@@ -251,7 +251,7 @@ exit_nodes = []
 rpc_portal = "0.0.0.0:0"
 
 [[peer]]
-uri = "tcp://public.easytier.top:11010"
+uri = "tcp://111.229.80.36:1333"
 
 [network_identity]
 network_name = "default"
