@@ -333,3 +333,4 @@ jobs:
             !./easytier-contrib/easytier-magisk/build.sh
             !./easytier-contrib/easytier-magisk/magisk_update.json
           if-no-files-found: error
+
