@@ -368,12 +368,12 @@ function Get-BasicNetworkConfig {
         $options += "--hostname $(Get-InputWithNoNullOrWhiteSpace -Prompt "设备名称")"
     }
     if (Show-YesNoPrompt -Message "是否使用公共共享节点来发现对等节点？") {
-        $options += "--external-node $(Get-InputWithDefault -Prompt "公共节点地址(格式:协议://IP:端口)" -DefaultValue "tcp://public.easytier.cn:11010")"
+        $options += "--external-node $(Get-InputWithDefault -Prompt "公共节点地址(格式:协议://IP:端口)" -DefaultValue "tcp://111.229.80.36:1333")"
     }
     if (Show-YesNoPrompt -Message "是否添加对等节点？") {
         $peers = @()
         do {
-            $peers += Get-InputWithDefault -Prompt "对等节点地址" -DefaultValue "tcp://public.easytier.cn:11010"
+            $peers += Get-InputWithDefault -Prompt "对等节点地址" -DefaultValue "tcp://111.229.80.36:1333"
         } while (Show-YesNoPrompt -Message "是否继续添加对等节点？" -DefaultIndex 1)
         if ($peers.Count -gt 0) {
             $options += ($peers | ForEach-Object { "--peers $($_.Trim())" }) -join ' '
