@@ -4,7 +4,6 @@ use std::{
 };
 
 use http_connector::HttpTunnelConnector;
-use idna::domain_to_ascii;
 
 #[cfg(feature = "quic")]
 use crate::tunnel::quic::QUICTunnelConnector;
@@ -24,33 +23,6 @@ pub mod udp_hole_punch;
 
 pub mod dns_connector;
 pub mod http_connector;
-
-// 处理国际化域名（IDN）转换为Punycode的辅助函数
-fn parse_url_with_idn(input: &str) -> Result<url::Url, Error> {
-    let parsed = url::Url::parse(input).map_err(|_| Error::InvalidUrl(input.to_owned()))?;
-    
-    // 检查是否有主机名需要转换
-    if let Some(host) = parsed.host_str() {
-        // 检查是否包含非ASCII字符
-        if host.chars().any(|c| c.is_ascii() == false) {
-            // 将国际化域名转换为ASCII
-            match domain_to_ascii(host) {
-                Ok(ascii_host) => {
-                    // 重新构建URL，使用转换后的主机名
-                    let mut new_url = parsed.clone();
-                    new_url.set_host(Some(&ascii_host))
-                        .map_err(|_| Error::InvalidUrl(format!("Failed to set host: {}", input)))?;
-                    return Ok(new_url);
-                }
-                Err(_) => {
-                    return Err(Error::InvalidUrl(format!("Failed to convert IDN to ASCII: {}", input)));
-                }
-            }
-        }
-    }
-    
-    Ok(parsed)
-}
 
 async fn set_bind_addr_for_peer_connector(
     connector: &mut (impl TunnelConnector + ?Sized),
@@ -85,7 +57,7 @@ pub async fn create_connector_by_url(
     global_ctx: &ArcGlobalCtx,
     ip_version: IpVersion,
 ) -> Result<Box<dyn TunnelConnector + 'static>, Error> {
-    let url = parse_url_with_idn(url)?;
+    let url = url::Url::parse(url).map_err(|_| Error::InvalidUrl(url.to_owned()))?;
     let mut connector: Box<dyn TunnelConnector + 'static> = match url.scheme() {
         "tcp" => {
             let dst_addr =

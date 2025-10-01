@@ -13,7 +13,6 @@ use std::{
 use anyhow::Context;
 use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
-use idna::domain_to_ascii;
 use clap_complete::Shell;
 use easytier::{
     common::{
@@ -1125,45 +1124,19 @@ fn win_service_main(arg: Vec<std::ffi::OsString>) {
     win_service_event_loop(stop_notify_recv, cli, status_handle);
 }
 
-// 处理国际化域名（IDN）转换为Punycode的辅助函数
-fn parse_url_with_idn(input: &str) -> Result<url::Url, anyhow::Error> {
-    let parsed = url::Url::parse(input)?;
-    
-    // 检查是否有主机名需要转换
-    if let Some(host) = parsed.host_str() {
-        // 检查是否包含非ASCII字符
-        if host.chars().any(|c| c.is_ascii() == false) {
-            // 将国际化域名转换为ASCII
-            match domain_to_ascii(host) {
-                Ok(ascii_host) => {
-                    // 重新构建URL，使用转换后的主机名
-                    let mut new_url = parsed.clone();
-                    new_url.set_host(Some(&ascii_host))
-                        .map_err(|e| anyhow::anyhow!("Failed to set host: {}", e))?;
-                    return Ok(new_url);
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Failed to convert IDN to ASCII: {}", e));
-                }
-            }
-        }
-    }
-    
-    Ok(parsed)
-}
-
 async fn run_main(cli: Cli) -> anyhow::Result<()> {
     init_logger(&cli.logging_options, true)?;
 
     if cli.config_server.is_some() {
         set_default_machine_id(cli.machine_id);
         let config_server_url_s = cli.config_server.clone().unwrap();
-        let config_server_url = match parse_url_with_idn(&config_server_url_s) {
+        let config_server_url = match url::Url::parse(&config_server_url_s) {
             Ok(u) => u,
-            Err(_) => parse_url_with_idn(&format!(
+            Err(_) => format!(
                 "udp://config-server.easytier.cn:22020/{}",
                 config_server_url_s
-            ))
+            )
+            .parse()
             .unwrap(),
         };
 
