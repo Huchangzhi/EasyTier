@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Context;
 use dashmap::DashSet;
+use idna::domain_to_ascii;
 use tokio::{
     sync::{
         broadcast::{error::RecvError, Receiver},
@@ -41,8 +42,36 @@ use crate::{
 };
 
 use super::create_connector_by_url;
+use url;
 
 type ConnectorMap = Arc<DashSet<String>>;
+
+// 处理国际化域名（IDN）转换为Punycode的辅助函数
+fn parse_url_with_idn(input: &str) -> Result<url::Url, anyhow::Error> {
+    let parsed = url::Url::parse(input)?;
+    
+    // 检查是否有主机名需要转换
+    if let Some(host) = parsed.host_str() {
+        // 检查是否包含非ASCII字符
+        if host.chars().any(|c| c.is_ascii() == false) {
+            // 将国际化域名转换为ASCII
+            match domain_to_ascii(host) {
+                Ok(ascii_host) => {
+                    // 重新构建URL，使用转换后的主机名
+                    let mut new_url = parsed.clone();
+                    new_url.set_host(Some(&ascii_host))
+                        .map_err(|e| anyhow::anyhow!("Failed to set host: {}", e))?;
+                    return Ok(new_url);
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to convert IDN to ASCII: {}", e));
+                }
+            }
+        }
+    }
+    
+    Ok(parsed)
+}
 
 #[derive(Debug, Clone)]
 struct ReconnResult {
@@ -149,7 +178,7 @@ impl ManualConnectorManager {
             ret.insert(
                 0,
                 Connector {
-                    url: Some(conn_url.parse().unwrap()),
+                    url: Some(parse_url_with_idn(&conn_url).unwrap()),
                     status: status.into(),
                 },
             );
@@ -162,7 +191,7 @@ impl ManualConnectorManager {
             ret.insert(
                 0,
                 Connector {
-                    url: Some(conn_url.parse().unwrap()),
+                    url: Some(parse_url_with_idn(&conn_url).unwrap()),
                     status: ConnectorStatus::Connecting.into(),
                 },
             );

@@ -17,6 +17,7 @@ use crate::{
 };
 use anyhow::Context;
 use chrono::{DateTime, Local};
+use idna::domain_to_ascii;
 use std::net::SocketAddr;
 use std::{
     collections::VecDeque,
@@ -25,6 +26,33 @@ use std::{
 use tokio::{sync::broadcast, task::JoinSet};
 
 pub type MyNodeInfo = crate::proto::web::MyNodeInfo;
+
+// 处理国际化域名（IDN）转换为Punycode的辅助函数
+fn parse_url_with_idn(input: &str) -> Result<url::Url, anyhow::Error> {
+    let parsed = url::Url::parse(input)?;
+    
+    // 检查是否有主机名需要转换
+    if let Some(host) = parsed.host_str() {
+        // 检查是否包含非ASCII字符
+        if host.chars().any(|c| c.is_ascii() == false) {
+            // 将国际化域名转换为ASCII
+            match domain_to_ascii(host) {
+                Ok(ascii_host) => {
+                    // 重新构建URL，使用转换后的主机名
+                    let mut new_url = parsed.clone();
+                    new_url.set_host(Some(&ascii_host))
+                        .map_err(|e| anyhow::anyhow!("Failed to set host: {}", e))?;
+                    return Ok(new_url);
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to convert IDN to ASCII: {}", e));
+                }
+            }
+        }
+    }
+    
+    Ok(parsed)
+}
 
 #[derive(serde::Serialize, Clone)]
 pub struct Event {
@@ -534,7 +562,7 @@ impl NetworkConfig {
             NetworkingMethod::PublicServer => {
                 let public_server_url = self.public_server_url.clone().unwrap_or_default();
                 cfg.set_peers(vec![PeerConfig {
-                    uri: public_server_url.parse().with_context(|| {
+                    uri: parse_url_with_idn(&public_server_url).with_context(|| {
                         format!("failed to parse public server uri: {}", public_server_url)
                     })?,
                 }]);
@@ -546,8 +574,7 @@ impl NetworkConfig {
                         continue;
                     }
                     peers.push(PeerConfig {
-                        uri: peer_url
-                            .parse()
+                        uri: parse_url_with_idn(peer_url)
                             .with_context(|| format!("failed to parse peer uri: {}", peer_url))?,
                     });
                 }
@@ -563,8 +590,7 @@ impl NetworkConfig {
                 continue;
             }
             listener_urls.push(
-                listener_url
-                    .parse()
+                parse_url_with_idn(listener_url)
                     .with_context(|| format!("failed to parse listener uri: {}", listener_url))?,
             );
         }

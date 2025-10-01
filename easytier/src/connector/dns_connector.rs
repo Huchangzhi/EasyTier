@@ -12,10 +12,39 @@ use anyhow::Context;
 use dashmap::DashSet;
 use hickory_resolver::proto::rr::rdata::SRV;
 use rand::{seq::SliceRandom, Rng as _};
+use url;
 
 use crate::proto::common::TunnelInfo;
+use idna::domain_to_ascii;
 
 use super::{create_connector_by_url, http_connector::TunnelWithInfo};
+
+// 处理国际化域名（IDN）转换为Punycode的辅助函数
+fn parse_url_with_idn(input: &str) -> Result<url::Url, anyhow::Error> {
+    let parsed = url::Url::parse(input)?;
+    
+    // 检查是否有主机名需要转换
+    if let Some(host) = parsed.host_str() {
+        // 检查是否包含非ASCII字符
+        if host.chars().any(|c| c.is_ascii() == false) {
+            // 将国际化域名转换为ASCII
+            match domain_to_ascii(host) {
+                Ok(ascii_host) => {
+                    // 重新构建URL，使用转换后的主机名
+                    let mut new_url = parsed.clone();
+                    new_url.set_host(Some(&ascii_host))
+                        .map_err(|e| anyhow::anyhow!("Failed to set host: {}", e))?;
+                    return Ok(new_url);
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Failed to convert IDN to ASCII: {}", e));
+                }
+            }
+        }
+    }
+    
+    Ok(parsed)
+}
 
 fn weighted_choice<T>(options: &[(T, u64)]) -> Option<&T> {
     let total_weight = options.iter().map(|(_, weight)| *weight).sum();
@@ -91,7 +120,7 @@ impl DNSTunnelConnector {
         let dst_url = format!("{}://{}:{}", protocol, connector_dst, record.port());
 
         Ok((
-            dst_url.parse().with_context(|| {
+            parse_url_with_idn(&dst_url).with_context(|| {
                 format!(
                     "parse dst_url failed, protocol: {}, connector_dst: {}, port: {}, dst_url: {}",
                     protocol,
