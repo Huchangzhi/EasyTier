@@ -193,7 +193,7 @@ impl RoutePeerInfo {
     }
 }
 
-impl From<RoutePeerInfo> for crate::proto::cli::Route {
+impl From<RoutePeerInfo> for crate::proto::api::instance::Route {
     fn from(val: RoutePeerInfo) -> Self {
         let network_length = if val.network_length == 0 {
             24
@@ -201,7 +201,7 @@ impl From<RoutePeerInfo> for crate::proto::cli::Route {
             val.network_length
         };
 
-        crate::proto::cli::Route {
+        crate::proto::api::instance::Route {
             peer_id: val.peer_id,
             ipv4_addr: val.ipv4_addr.map(|ipv4_addr| Ipv4Inet {
                 address: Some(ipv4_addr),
@@ -525,8 +525,10 @@ impl SyncedRouteInfo {
         let new_version = new.version;
         let old_version = old.version;
         *old = new;
+        drop(old);
 
         if new_version != old_version {
+            self.update_my_group_trusts(my_peer_id);
             self.version.inc();
             true
         } else {
@@ -706,6 +708,18 @@ impl SyncedRouteInfo {
                 }
             }
         }
+    }
+
+    fn update_my_group_trusts(&self, my_peer_id: PeerId) {
+        let mut my_group_map = HashMap::new();
+        let mut my_group_names = Vec::new();
+        for group in self.peer_infos.entry(my_peer_id).or_default().groups.iter() {
+            my_group_map.insert(group.group_name.clone(), group.group_proof.clone());
+            my_group_names.push(group.group_name.clone());
+        }
+        self.group_trust_map.insert(my_peer_id, my_group_map);
+        self.group_trust_map_cache
+            .insert(my_peer_id, Arc::new(my_group_names));
     }
 }
 
@@ -2361,7 +2375,7 @@ impl Route for PeerRoute {
             .map(|x| x.next_hop_peer_id)
     }
 
-    async fn list_routes(&self) -> Vec<crate::proto::cli::Route> {
+    async fn list_routes(&self) -> Vec<crate::proto::api::instance::Route> {
         let route_table = &self.service_impl.route_table;
         let route_table_with_cost = &self.service_impl.route_table_with_cost;
         let mut routes = Vec::new();
@@ -2373,7 +2387,7 @@ impl Route for PeerRoute {
                 continue;
             };
             let next_hop_peer_latency_first = route_table_with_cost.get_next_hop(*item.key());
-            let mut route: crate::proto::cli::Route = item.value().clone().into();
+            let mut route: crate::proto::api::instance::Route = item.value().clone().into();
             route.next_hop_peer_id = next_hop_peer.next_hop_peer_id;
             route.cost = next_hop_peer.path_len as i32;
             route.path_latency = next_hop_peer.path_latency;
