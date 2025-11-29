@@ -125,6 +125,24 @@ async function runNetworkCb(cfg: NetworkTypes.NetworkConfig, cb: () => void) {
   cb()
 }
 
+async function setAsDefaultCb(cfg: NetworkTypes.NetworkConfig) {
+  // 保存默认网络ID到localStorage
+  localStorage.setItem('defaultNetworkId', cfg.instance_id);
+  toast.add({ severity: 'success', detail: t('network_set_as_default'), life: 3000 });
+
+  // 自动运行网络并切换到运行状态
+  if (!networkStore.networkInstanceIds.includes(cfg.instance_id)) {
+    await runNetworkCb(cfg, () => {
+      // 切换到运行状态面板
+    });
+  }
+}
+
+function unsetDefaultNetwork() {
+  localStorage.removeItem('defaultNetworkId');
+  toast.add({ severity: 'info', detail: t('default_network_unset'), life: 3000 });
+}
+
 async function stopNetworkCb(cfg: NetworkTypes.NetworkConfig, cb: () => void) {
   // console.log('stopNetworkCb', cfg, cb)
   cb()
@@ -151,6 +169,11 @@ onMounted(async () => {
   }, 1000)
 })
 onUnmounted(() => clearInterval(intervalId))
+
+const isDefaultNetwork = computed(() => {
+  const defaultNetworkId = localStorage.getItem('defaultNetworkId');
+  return defaultNetworkId === networkStore.curNetworkId;
+})
 
 const activeStep = computed(() => {
   return networkStore.networkInstanceIds.includes(networkStore.curNetworkId) ? '2' : '1'
@@ -253,6 +276,16 @@ onBeforeMount(async () => {
         networkStore.addNetworkInstance(cfg.instance_id)
         await runNetworkInstance(cfg)
       }
+    }
+  }
+
+  // 检查是否有默认网络需要启动
+  const defaultNetworkId = localStorage.getItem('defaultNetworkId');
+  if (defaultNetworkId && !networkStore.networkInstanceIds.includes(defaultNetworkId)) {
+    const defaultNetwork = networkStore.networkList.find((item: NetworkTypes.NetworkConfig) => item.instance_id === defaultNetworkId);
+    if (defaultNetwork) {
+      networkStore.addNetworkInstance(defaultNetwork.instance_id);
+      await runNetworkInstance(defaultNetwork);
     }
   }
 })
@@ -364,15 +397,25 @@ async function saveTomlConfig(tomlConfig: string) {
         <StepPanels value="1">
           <StepPanel v-slot="{ activateCallback = (s: string) => { } } = {}" value="1">
             <Config :instance-id="networkStore.curNetworkId" :config-invalid="messageBarSeverity !== Severity.None"
-              :cur-network="curNetworkConfig" @run-network="runNetworkCb($event, () => activateCallback('2'))" />
+              :cur-network="curNetworkConfig" @run-network="runNetworkCb($event, () => activateCallback('2'))"
+              @set-as-default="setAsDefaultCb($event)" />
           </StepPanel>
           <StepPanel v-slot="{ activateCallback = (s: string) => { } } = {}" value="2">
-            <div class="flex flex-col">
-              <Status :cur-network-inst="curNetworkInst" />
-            </div>
-            <div class="flex pt-6 justify-center">
-              <Button :label="t('stop_network')" severity="danger" icon="pi pi-arrow-left"
-                @click="stopNetworkCb(networkStore.curNetwork, () => activateCallback('1'))" />
+            <div class="flex flex-col relative">
+              <Status v-if="!isDefaultNetwork" :cur-network-inst="curNetworkInst" />
+              <div v-else class="text-center py-10">
+                <i class="pi pi-check-circle text-green-500 text-6xl mb-4"></i>
+                <h2 class="text-xl font-semibold">{{ t('network_running') }}</h2>
+                <p class="text-gray-500 mt-2">{{ t('default_network_running') }}</p>
+              </div>
+              <div class="absolute bottom-4 right-4" v-if="isDefaultNetwork">
+                <Button :label="t('unset_default')" icon="pi pi-star" severity="secondary"
+                  @click="unsetDefaultNetwork" />
+              </div>
+              <div class="flex pt-6 justify-center" v-if="!isDefaultNetwork">
+                <Button :label="t('stop_network')" severity="danger" icon="pi pi-arrow-left"
+                  @click="stopNetworkCb(networkStore.curNetwork, () => activateCallback('1'))" />
+              </div>
             </div>
           </StepPanel>
         </StepPanels>

@@ -17,7 +17,7 @@ const props = defineProps<{
   hostname?: string
 }>()
 
-defineEmits(['runNetwork'])
+defineEmits(['runNetwork', 'setAsDefault'])
 
 const curNetwork = defineModel('curNetwork', {
   type: Object as () => NetworkConfig,
@@ -454,9 +454,11 @@ const portForwardProtocolOptions = ref(["tcp", "udp"]);
             </div>
           </Panel>
 
-          <div class="flex pt-6 justify-center">
+          <div class="flex pt-6 justify-center gap-2">
             <Button :label="t('run_network')" icon="pi pi-arrow-right" icon-pos="right" :disabled="configInvalid"
               @click="$emit('runNetwork', curNetwork)" />
+            <Button :label="t('set_as_default')" icon="pi pi-star-fill" severity="secondary"
+              @click="$emit('setAsDefault', curNetwork)" />
           </div>
         </div>
       </div>

@@ -182,8 +182,13 @@ status:
 
 run_network: 运行网络
 stop_network: 停止网络
+set_as_default: 设为默认
+unset_default: 取消默认
 network_running: 运行中
 network_stopped: 已停止
+network_set_as_default: 网络已设为默认
+default_network_running: 默认网络已启动
+default_network_unset: 默认网络已取消
 dhcp_experimental_warning: 实验性警告！使用DHCP时如果组网环境中发生IP冲突，将自动更改IP。
 
 tray:
