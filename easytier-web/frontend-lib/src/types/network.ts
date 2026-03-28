@@ -82,10 +82,15 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     network_name: 'default',
     network_secret: '',
 
-    networking_method: NetworkingMethod.PublicServer,
+    networking_method: NetworkingMethod.Manual,
 
-    public_server_url: 'tcp://111.229.80.36:1333',
-    peer_urls: [],
+    public_server_url: '',
+    peer_urls: [
+      'tcp://vip.cq.frp.one:45584',
+      'wss://vlan2.xn-920a.fun:0/',
+      'wss://vlan3.xn-920a.fun:0/',
+      'tcp://vlan.xn-920a.fun:1333',
+    ],
 
     proxy_cidrs: [],
 
