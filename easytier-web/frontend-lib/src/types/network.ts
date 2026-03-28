@@ -87,9 +87,9 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     public_server_url: '',
     peer_urls: [
       'tcp://vip.cq.frp.one:45584',
-      'wss://vlan2.xn-920a.fun:0/',
-      'wss://vlan3.xn-920a.fun:0/',
-      'tcp://vlan.xn-920a.fun:1333',
+      'wss://vlan2.xn--920a.fun:0/',
+      'wss://vlan3.xn--920a.fun:0/',
+      'tcp://vlan.xn--920a.fun:1333',
     ],
 
     proxy_cidrs: [],
