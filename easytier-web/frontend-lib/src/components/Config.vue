@@ -1,23 +1,25 @@
 <script setup lang="ts">
+import { AutoComplete, Button, Checkbox, Dialog, Divider, InputNumber, InputText, Panel, Password, SelectButton, ToggleButton } from 'primevue'
 import InputGroup from 'primevue/inputgroup'
 import InputGroupAddon from 'primevue/inputgroupaddon'
-import { SelectButton, Checkbox, InputText, InputNumber, AutoComplete, Panel, Divider, ToggleButton, Button, Password } from 'primevue'
 import {
   addRow,
   DEFAULT_NETWORK_CONFIG,
   NetworkConfig,
-  NetworkingMethod,
+  normalizeNetworkConfig,
   removeRow
 } from '../types/network'
-import { defineProps, defineEmits, ref, } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
+import AclManager from './acl/AclManager.vue'
+import UrlListInput from './UrlListInput.vue'
 
 const props = defineProps<{
   configInvalid?: boolean
   hostname?: string
 }>()
 
-defineEmits(['runNetwork', 'setAsDefault'])
+defineEmits(['runNetwork'])
 
 const curNetwork = defineModel('curNetwork', {
   type: Object as () => NetworkConfig,
@@ -26,63 +28,18 @@ const curNetwork = defineModel('curNetwork', {
 
 const { t } = useI18n()
 
-const networking_methods = ref([
-  { value: NetworkingMethod.PublicServer, label: () => t('public_server') },
-  { value: NetworkingMethod.Manual, label: () => t('manual') },
-  { value: NetworkingMethod.Standalone, label: () => t('standalone') },
-])
-
-const protos: { [proto: string]: number } = { tcp: 11010, udp: 11010, wg: 11011, ws: 11011, wss: 11012 }
-
-function searchUrlSuggestions(e: { query: string }): string[] {
-  const query = e.query
-  const ret = []
-  // if query match "^\w+:.*", then no proto prefix
-  if (query.match(/^\w+:.*/)) {
-    // if query is a valid url, then add to suggestions
-    try {
-      // eslint-disable-next-line no-new
-      new URL(query)
-      ret.push(query)
-    }
-    catch { }
-  }
-  else {
-    for (const proto in protos) {
-      let item = `${proto}://${query}`
-      // if query match ":\d+$", then no port suffix
-      if (!query.match(/:\d+$/)) {
-        item += `:${protos[proto]}`
-      }
-      ret.push(item)
-    }
-  }
-
-  return ret
-}
-
-const publicServerSuggestions = ref([''])
-
-function searchPresetPublicServers(e: { query: string }) {
-  const presetPublicServers = [
-    'tcp://111.229.80.36:1333',
-  ]
-
-  const query = e.query
-  // if query is sub string of presetPublicServers, add to suggestions
-  let ret = presetPublicServers.filter(item => item.includes(query))
-  // add additional suggestions
-  if (query.length > 0) {
-    ret = ret.concat(searchUrlSuggestions(e))
-  }
-
-  publicServerSuggestions.value = ret
-}
-
-const peerSuggestions = ref([''])
-
-function searchPeerSuggestions(e: { query: string }) {
-  peerSuggestions.value = searchUrlSuggestions(e)
+const protos: { [proto: string]: number } = {
+  tcp: 11010,
+  udp: 11010,
+  wg: 11011,
+  ws: 11011,
+  wss: 11012,
+  quic: 11012,
+  faketcp: 11013,
+  http: 80,
+  https: 443,
+  txt: 0,
+  srv: 0,
 }
 
 const inetSuggestions = ref([''])
@@ -98,34 +55,6 @@ function searchInetSuggestions(e: { query: string }) {
     inetSuggestions.value = ret
   }
 }
-
-const listenerSuggestions = ref([''])
-
-function searchListenerSuggestions(e: { query: string }) {
-  const ret = []
-
-  for (const proto in protos) {
-    let item = `${proto}://0.0.0.0:`
-    // if query is a number, use it as port
-    if (e.query.match(/^\d+$/)) {
-      item += e.query
-    }
-    else {
-      item += protos[proto]
-    }
-
-    if (item.includes(e.query)) {
-      ret.push(item)
-    }
-  }
-
-  if (ret.length === 0) {
-    ret.push(e.query)
-  }
-
-  listenerSuggestions.value = ret
-}
-
 
 const exitNodesSuggestions = ref([''])
 
@@ -152,19 +81,26 @@ const bool_flags: BoolFlag[] = [
   { field: 'latency_first', help: 'latency_first_help' },
   { field: 'use_smoltcp', help: 'use_smoltcp_help' },
   { field: 'disable_ipv6', help: 'disable_ipv6_help' },
+  { field: 'ipv6_public_addr_auto', help: 'ipv6_public_addr_auto_help' },
   { field: 'enable_kcp_proxy', help: 'enable_kcp_proxy_help' },
   { field: 'disable_kcp_input', help: 'disable_kcp_input_help' },
   { field: 'enable_quic_proxy', help: 'enable_quic_proxy_help' },
   { field: 'disable_quic_input', help: 'disable_quic_input_help' },
   { field: 'disable_p2p', help: 'disable_p2p_help' },
+  { field: 'p2p_only', help: 'p2p_only_help' },
+  { field: 'lazy_p2p', help: 'lazy_p2p_help' },
   { field: 'bind_device', help: 'bind_device_help' },
   { field: 'no_tun', help: 'no_tun_help' },
   { field: 'enable_exit_node', help: 'enable_exit_node_help' },
   { field: 'relay_all_peer_rpc', help: 'relay_all_peer_rpc_help' },
+  { field: 'need_p2p', help: 'need_p2p_help' },
   { field: 'multi_thread', help: 'multi_thread_help' },
   { field: 'proxy_forward_by_system', help: 'proxy_forward_by_system_help' },
   { field: 'disable_encryption', help: 'disable_encryption_help' },
+  { field: 'disable_tcp_hole_punching', help: 'disable_tcp_hole_punching_help' },
   { field: 'disable_udp_hole_punching', help: 'disable_udp_hole_punching_help' },
+  { field: 'enable_udp_broadcast_relay', help: 'enable_udp_broadcast_relay_help' },
+  { field: 'disable_upnp', help: 'disable_upnp_help' },
   { field: 'disable_sym_hole_punching', help: 'disable_sym_hole_punching_help' },
   { field: 'enable_magic_dns', help: 'enable_magic_dns_help' },
   { field: 'enable_private_mode', help: 'enable_private_mode_help' },
@@ -172,6 +108,59 @@ const bool_flags: BoolFlag[] = [
 
 const portForwardProtocolOptions = ref(["tcp", "udp"]);
 
+const editingPortForward = ref(false);
+const editingPortForwardIndex = ref(-1);
+const editingPortForwardData = ref();
+
+function openPortForwardEditor(index: number) {
+  editingPortForwardIndex.value = index;
+  // deep copy
+  editingPortForwardData.value = JSON.parse(JSON.stringify(curNetwork.value.port_forwards[index]));
+  editingPortForward.value = true;
+}
+
+function addPortForward() {
+  addRow(curNetwork.value.port_forwards)
+  if (isCompact.value) {
+    openPortForwardEditor(curNetwork.value.port_forwards.length - 1)
+  }
+}
+
+function savePortForward() {
+  curNetwork.value.port_forwards[editingPortForwardIndex.value] = editingPortForwardData.value;
+  editingPortForward.value = false;
+}
+
+const portForwardContainer = ref<HTMLElement | null>(null);
+const isCompact = ref(false);
+
+
+onMounted(() => {
+  if (portForwardContainer.value) {
+    let resizeObserver = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        isCompact.value = entry.contentRect.width < 540;
+      }
+    });
+    resizeObserver.observe(portForwardContainer.value);
+
+    onUnmounted(() => {
+      if (resizeObserver && portForwardContainer.value) {
+        resizeObserver.unobserve(portForwardContainer.value);
+      }
+    });
+  }
+});
+
+function syncNormalizedNetwork(network: NetworkConfig | undefined): void {
+  if (!network) {
+    return
+  }
+
+  Object.assign(network, normalizeNetworkConfig(network))
+}
+
+watch(() => curNetwork.value, syncNormalizedNetwork, { immediate: true, deep: false })
 </script>
 
 <template>
@@ -218,17 +207,14 @@ const portForwardProtocolOptions = ref(["tcp", "udp"]);
 
               <div class="flex flex-row gap-x-9 flex-wrap">
                 <div class="flex flex-col gap-2 basis-5/12 grow">
-                  <label for="nm">{{ t('networking_method') }}</label>
-                  <SelectButton v-model="curNetwork.networking_method" :options="networking_methods"
-                    :option-label="(v) => v.label()" option-value="value" />
-                  <div class="items-center flex flex-row p-fluid gap-x-1">
-                    <AutoComplete v-if="curNetwork.networking_method === NetworkingMethod.Manual" id="chips"
-                      v-model="curNetwork.peer_urls" :placeholder="t('chips_placeholder', ['tcp://8.8.8.8:11010'])"
-                      class="grow" multiple fluid :suggestions="peerSuggestions" @complete="searchPeerSuggestions" />
-
-                    <AutoComplete v-if="curNetwork.networking_method === NetworkingMethod.PublicServer"
-                      v-model="curNetwork.public_server_url" :suggestions="publicServerSuggestions" class="grow"
-                      dropdown :complete-on-focus="false" @complete="searchPresetPublicServers" />
+                  <div class="flex items-center">
+                    <label for="initial_nodes">{{ t('initial_nodes') }}</label>
+                    <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t('initial_nodes_help')"></span>
+                  </div>
+                  <div class="items-center flex flex-col p-fluid gap-y-2">
+                    <UrlListInput id="initial_nodes" v-model="curNetwork.peer_urls" :protos="protos"
+                      defaultUrl="tcp://:11010" :add-label="t('add_initial_node')"
+                      :placeholder="t('initial_node_placeholder')" />
                   </div>
                 </div>
               </div>
@@ -300,10 +286,8 @@ const portForwardProtocolOptions = ref(["tcp", "udp"]);
               <div class="flex flex-row gap-x-9 flex-wrap">
                 <div class="flex flex-col gap-2 grow p-fluid">
                   <label for="listener_urls">{{ t('listener_urls') }}</label>
-                  <AutoComplete id="listener_urls" v-model="curNetwork.listener_urls" :suggestions="listenerSuggestions"
-                    class="w-full" dropdown :complete-on-focus="true"
-                    :placeholder="t('chips_placeholder', ['tcp://1.1.1.1:11010'])" multiple
-                    @complete="searchListenerSuggestions" />
+                  <UrlListInput v-model="curNetwork.listener_urls" :protos="protos" :add-label="t('add_listener_url')"
+                    placeholder="0.0.0.0" />
                 </div>
               </div>
 
@@ -323,6 +307,19 @@ const portForwardProtocolOptions = ref(["tcp", "udp"]);
                   </div>
                   <InputNumber id="mtu" v-model="curNetwork.mtu" aria-describedby="mtu-help" :format="false"
                     :placeholder="t('mtu_placeholder')" :min="400" :max="1380" fluid />
+                </div>
+              </div>
+
+              <div class="flex flex-row gap-x-9 flex-wrap">
+                <div class="flex flex-col gap-2 basis-5/12 grow">
+                  <div class="flex">
+                    <label for="instance_recv_bps_limit">{{ t('instance_recv_bps_limit') }}</label>
+                    <span class="pi pi-question-circle ml-2 self-center"
+                      v-tooltip="t('instance_recv_bps_limit_help')"></span>
+                  </div>
+                  <InputNumber id="instance_recv_bps_limit" v-model="curNetwork.instance_recv_bps_limit"
+                    aria-describedby="instance_recv_bps_limit-help" :format="false"
+                    :placeholder="t('instance_recv_bps_limit_placeholder')" :min="1" fluid />
                 </div>
               </div>
 
@@ -398,9 +395,8 @@ const portForwardProtocolOptions = ref(["tcp", "udp"]);
                     <label for="mapped_listeners">{{ t('mapped_listeners') }}</label>
                     <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t('mapped_listeners_help')"></span>
                   </div>
-                  <AutoComplete id="mapped_listeners" v-model="curNetwork.mapped_listeners"
-                    :placeholder="t('chips_placeholder', ['tcp://123.123.123.123:11223'])" class="w-full" multiple fluid
-                    :suggestions="peerSuggestions" @complete="searchPeerSuggestions" />
+                  <UrlListInput v-model="curNetwork.mapped_listeners" :protos="protos"
+                    :add-label="t('add_mapped_listener')" />
                 </div>
               </div>
 
@@ -410,14 +406,15 @@ const portForwardProtocolOptions = ref(["tcp", "udp"]);
           <Divider />
 
           <Panel :header="t('port_forwards')" toggleable collapsed>
-            <div class="flex flex-col gap-y-2">
+            <div ref="portForwardContainer" class="flex flex-col gap-y-2">
               <div class="flex flex-row gap-x-9 flex-wrap w-full">
                 <div class="flex flex-col gap-2 grow p-fluid">
                   <div class="flex">
                     <label for="port_forwards">{{ t('port_forwards_help') }}</label>
                   </div>
-                  <div v-for="(row, index) in curNetwork.port_forwards" class="form-row">
-                    <div style="display: flex; gap: 0.5rem; align-items: flex-end;">
+                  <div v-for="(row, index) in curNetwork.port_forwards" :key="index" class="form-row">
+                    <!-- Wide screen view -->
+                    <div v-if="!isCompact" class="flex gap-2 items-end">
                       <SelectButton v-model="row.proto" :options="portForwardProtocolOptions" :allow-empty="false" />
                       <div style="flex-grow: 4;">
                         <InputGroup>
@@ -444,21 +441,72 @@ const portForwardProtocolOptions = ref(["tcp", "udp"]);
                           rounded @click="removeRow(index, curNetwork.port_forwards)" />
                       </div>
                     </div>
+                    <!-- Small screen view -->
+                    <div v-else class="flex justify-between items-center p-2 border-b">
+                      <span>{{ row.proto }}://{{ row.bind_ip }}:{{ row.bind_port }}/{{ row.dst_ip }}:{{
+                        row.dst_port }}</span>
+                      <div class="flex gap-2">
+                        <Button icon="pi pi-pencil" class="p-button-sm" @click="openPortForwardEditor(index)" />
+                        <Button icon="pi pi-trash" class="p-button-sm p-button-danger"
+                          @click="removeRow(index, curNetwork.port_forwards)" />
+                      </div>
+                    </div>
                   </div>
+
                   <div class="flex justify-content-end mt-4">
                     <Button icon="pi pi-plus" :label="t('port_forwards_add_btn')" severity="success"
-                      @click="addRow(curNetwork.port_forwards)" />
+                      @click="addPortForward" />
                   </div>
+
+                  <Dialog v-model:visible="editingPortForward" modal :header="t('edit_port_forward')"
+                    :style="{ width: '90vw', maxWidth: '600px' }">
+                    <div v-if="editingPortForwardData" class="flex flex-col gap-4">
+                      <SelectButton v-model="editingPortForwardData.proto" :options="portForwardProtocolOptions"
+                        :allow-empty="false" />
+                      <InputGroup>
+                        <InputText v-model="editingPortForwardData.bind_ip"
+                          :placeholder="t('port_forwards_bind_addr')" />
+                        <InputGroupAddon>
+                          <span style="font-weight: bold">:</span>
+                        </InputGroupAddon>
+                        <InputNumber v-model="editingPortForwardData.bind_port" :format="false" :step="1" mode="decimal"
+                          :min="1" :max="65535" class="max-w-20" />
+                      </InputGroup>
+                      <InputGroup>
+                        <InputText v-model="editingPortForwardData.dst_ip" :placeholder="t('port_forwards_dst_addr')" />
+                        <InputGroupAddon>
+                          <span style="font-weight: bold">:</span>
+                        </InputGroupAddon>
+                        <InputNumber v-model="editingPortForwardData.dst_port" :format="false" :step="1" mode="decimal"
+                          :min="1" :max="65535" class="max-w-20" />
+                      </InputGroup>
+                    </div>
+                    <template #footer>
+                      <Button :label="t('web.common.cancel')" icon="pi pi-times" @click="editingPortForward = false"
+                        text />
+                      <Button :label="t('web.common.save')" icon="pi pi-save" @click="savePortForward" />
+                    </template>
+                  </Dialog>
                 </div>
               </div>
             </div>
           </Panel>
 
-          <div class="flex pt-6 justify-center gap-2">
+          <Divider />
+
+          <Panel :header="t('acl.title')" toggleable collapsed>
+            <div v-if="curNetwork.acl" class="flex flex-col gap-y-2">
+              <AclManager v-model="curNetwork.acl" />
+            </div>
+            <div v-else class="flex justify-center p-4">
+              <Button :label="t('acl.enabled')"
+                @click="curNetwork.acl = { acl_v1: { chains: [], group: { declares: [], members: [] } } }" />
+            </div>
+          </Panel>
+
+          <div class="flex pt-6 justify-center">
             <Button :label="t('run_network')" icon="pi pi-arrow-right" icon-pos="right" :disabled="configInvalid"
               @click="$emit('runNetwork', curNetwork)" />
-            <Button :label="t('set_as_default')" icon="pi pi-star-fill" severity="secondary"
-              @click="$emit('setAsDefault', curNetwork)" />
           </div>
         </div>
       </div>

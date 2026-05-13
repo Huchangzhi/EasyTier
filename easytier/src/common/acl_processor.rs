@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr as _,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::common::{config::ConfigLoader, global_ctx::ArcGlobalCtx, token_bucket::TokenBucket};
@@ -26,6 +26,12 @@ impl RateLimitKey {
             rule_priority,
         }
     }
+}
+
+/// Value wrapper for rate limiters with last update timestamp
+pub struct RateLimitValue {
+    pub token_bucket: Arc<TokenBucket>,
+    pub last_update: Instant,
 }
 
 // Performance-optimized rule identifier to avoid string allocations
@@ -104,7 +110,7 @@ impl AclCacheKey {
 pub struct AclCacheEntry {
     pub action: Action,
     pub matched_rule: RuleId,
-    pub last_access: u64,
+    pub last_access: std::time::Instant,
     // New fields to track rule characteristics for proper cache behavior
     pub conn_track_key: Option<String>,
     pub rate_limit_keys: Vec<RateLimitKey>,
@@ -188,7 +194,7 @@ impl AclLogContext {
 
 pub type SharedState = (
     Arc<DashMap<String, ConnTrackEntry>>,
-    Arc<DashMap<RateLimitKey, Arc<TokenBucket>>>,
+    Arc<DashMap<RateLimitKey, RateLimitValue>>,
     Arc<DashMap<AclStatKey, u64>>,
 );
 
@@ -209,7 +215,7 @@ pub struct AclProcessor {
     conn_track: Arc<DashMap<String, ConnTrackEntry>>,
 
     // Rate limiting buckets per rule using TokenBucket with optimized keys
-    rate_limiters: Arc<DashMap<RateLimitKey, Arc<TokenBucket>>>,
+    rate_limiters: Arc<DashMap<RateLimitKey, RateLimitValue>>,
 
     // Rule lookup cache with LRU cleanup
     rule_cache: Arc<DashMap<AclCacheKey, AclCacheEntry>>,
@@ -234,7 +240,7 @@ impl AclProcessor {
     pub fn new_with_shared_state(
         acl_config: Acl,
         conn_track: Option<Arc<DashMap<String, ConnTrackEntry>>>,
-        rate_limiters: Option<Arc<DashMap<RateLimitKey, Arc<TokenBucket>>>>,
+        rate_limiters: Option<Arc<DashMap<RateLimitKey, RateLimitValue>>>,
         stats: Option<Arc<DashMap<AclStatKey, u64>>>,
     ) -> Self {
         let (inbound_rules, outbound_rules, forward_rules) = Self::build_rules(&acl_config);
@@ -261,7 +267,7 @@ impl AclProcessor {
             conn_track: conn_track.unwrap_or_else(|| Arc::new(DashMap::new())),
             rate_limiters: rate_limiters.unwrap_or_else(|| Arc::new(DashMap::new())),
             rule_cache: Arc::new(DashMap::new()), // Always start with fresh cache
-            cache_max_size: 10000,                // Limit cache to 10k entries
+            cache_max_size: 1024,                 // Limit cache to 1k entries
             cache_cleanup_interval: Duration::from_secs(20), // Cleanup every 5 minutes
             stats: stats.unwrap_or_else(|| Arc::new(DashMap::new())),
             tasks,
@@ -339,7 +345,7 @@ impl AclProcessor {
                     .collect::<Vec<_>>();
 
                 // Sort by priority (higher priority first)
-                rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+                rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
                 match chain.chain_type() {
                     ChainType::Inbound => inbound_rules.extend(rules),
@@ -362,6 +368,7 @@ impl AclProcessor {
 
     /// Start periodic cache cleanup task
     fn start_cache_cleanup_task(&mut self) {
+        let rate_limiters = self.rate_limiters.clone();
         let rule_cache = self.rule_cache.clone();
         let cache_max_size = self.cache_max_size;
         let cleanup_interval = self.cache_cleanup_interval;
@@ -371,6 +378,10 @@ impl AclProcessor {
             loop {
                 interval.tick().await;
                 Self::cleanup_cache(&rule_cache, cache_max_size);
+                rule_cache.shrink_to_fit();
+
+                rate_limiters.retain(|_, v| v.last_update.elapsed() < cleanup_interval);
+                rate_limiters.shrink_to_fit();
             }
         });
 
@@ -380,19 +391,26 @@ impl AclProcessor {
             loop {
                 interval.tick().await;
                 Self::cleanup_expired_connections(conn_track.clone(), 60);
+                conn_track.shrink_to_fit();
             }
         });
     }
 
     /// Clean up cache using LRU strategy
     fn cleanup_cache(cache: &DashMap<AclCacheKey, AclCacheEntry>, max_size: usize) {
+        // remove cache not be used in last 15 second
+        let expired_timepoint = Instant::now()
+            .checked_sub(Duration::from_secs(15))
+            .unwrap_or(Instant::now());
+        cache.retain(|_, entry| entry.last_access > expired_timepoint);
+
         let current_size = cache.len();
         if current_size <= max_size {
             return;
         }
 
         // Remove oldest entries (LRU cleanup)
-        let mut entries: Vec<(AclCacheKey, u64)> = cache
+        let mut entries: Vec<(AclCacheKey, std::time::Instant)> = cache
             .iter()
             .map(|entry| (entry.key().clone(), entry.value().last_access))
             .collect();
@@ -472,10 +490,7 @@ impl AclProcessor {
         // If cache hit and can skip checks, return cached result
         if let Some(mut cached) = self.rule_cache.get_mut(&cache_key) {
             // Update last access time for LRU
-            cached.last_access = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
+            cached.last_access = Instant::now();
 
             self.increment_stat(AclStatKey::CacheHits);
             return self.process_packet_with_cache_entry(packet_info, &cached);
@@ -492,17 +507,14 @@ impl AclProcessor {
                     matched_rule: Some(RuleId::Default),
                     should_log: false,
                     log_context: Some(AclLogContext::UnsupportedChainType),
-                }
+                };
             }
         };
 
         let mut cache_entry = AclCacheEntry {
             action: Action::Allow,
             matched_rule: RuleId::Default,
-            last_access: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            last_access: Instant::now(),
             conn_track_key: None,
             rate_limit_keys: vec![],
             chain_type,
@@ -667,28 +679,28 @@ impl AclProcessor {
         }
 
         // Source port check
-        if let Some(src_port) = packet_info.src_port {
-            if !rule.src_port_ranges.is_empty() {
-                let matches = rule
-                    .src_port_ranges
-                    .iter()
-                    .any(|(start, end)| src_port >= *start && src_port <= *end);
-                if !matches {
-                    return false;
-                }
+        if let Some(src_port) = packet_info.src_port
+            && !rule.src_port_ranges.is_empty()
+        {
+            let matches = rule
+                .src_port_ranges
+                .iter()
+                .any(|(start, end)| src_port >= *start && src_port <= *end);
+            if !matches {
+                return false;
             }
         }
 
         // Destination port check
-        if let Some(dst_port) = packet_info.dst_port {
-            if !rule.dst_port_ranges.is_empty() {
-                let matches = rule
-                    .dst_port_ranges
-                    .iter()
-                    .any(|(start, end)| dst_port >= *start && dst_port <= *end);
-                if !matches {
-                    return false;
-                }
+        if let Some(dst_port) = packet_info.dst_port
+            && !rule.dst_port_ranges.is_empty()
+        {
+            let matches = rule
+                .dst_port_ranges
+                .iter()
+                .any(|(start, end)| dst_port >= *start && dst_port <= *end);
+            if !matches {
+                return false;
             }
         }
 
@@ -774,19 +786,26 @@ impl AclProcessor {
             return true; // No rate limiting
         }
 
-        let bucket = self
+        let mut rate_limiter = self
             .rate_limiters
             .entry(rule_key.clone())
             .or_insert_with(|| {
                 if !allow_create {
                     panic!("Rate limit bucket not found");
                 }
-                TokenBucket::new(burst as u64, rate as u64, Duration::from_millis(10))
-            })
-            .clone();
+                RateLimitValue {
+                    token_bucket: TokenBucket::new(
+                        burst as u64,
+                        rate as u64,
+                        Duration::from_millis(10),
+                    ),
+                    last_update: Instant::now(),
+                }
+            });
 
         // Try to consume 1 token (1 packet)
-        bucket.try_consume(1)
+        rate_limiter.last_update = Instant::now();
+        rate_limiter.token_bucket.try_consume(1)
     }
 
     /// Convert proto Rule to FastLookupRule
@@ -1081,7 +1100,7 @@ impl AclRuleBuilder {
             description: "Auto-generated inbound whitelist from CLI".to_string(),
             enabled: true,
             rules: vec![],
-            default_action: Action::Drop as i32, // Default deny
+            default_action: Action::Allow as i32,
         };
 
         let mut rule_priority = self.whitelist_priority.unwrap_or(1000u32);
@@ -1106,7 +1125,25 @@ impl AclRuleBuilder {
                 source_groups: vec![],
                 destination_groups: vec![],
             };
+            let tcp_rule_deny_other = Rule {
+                name: "tcp_whitelist_deny_other".to_string(),
+                description: "Auto-generated TCP whitelist rule to deny other ports".to_string(),
+                priority: 0,
+                enabled: true,
+                protocol: Protocol::Tcp as i32,
+                ports: vec!["0-65535".to_string()],
+                source_ips: vec![],
+                destination_ips: vec![],
+                source_ports: vec![],
+                action: Action::Drop as i32,
+                rate_limit: 0,
+                burst_limit: 0,
+                stateful: false,
+                source_groups: vec![],
+                destination_groups: vec![],
+            };
             inbound_chain.rules.push(tcp_rule);
+            inbound_chain.rules.push(tcp_rule_deny_other);
             rule_priority -= 1;
         }
 
@@ -1130,7 +1167,25 @@ impl AclRuleBuilder {
                 source_groups: vec![],
                 destination_groups: vec![],
             };
+            let udp_rule_deny_other = Rule {
+                name: "udp_whitelist_deny_other".to_string(),
+                description: "Auto-generated UDP whitelist rule to deny other ports".to_string(),
+                priority: 0,
+                enabled: true,
+                protocol: Protocol::Udp as i32,
+                ports: vec!["0-65535".to_string()],
+                source_ips: vec![],
+                destination_ips: vec![],
+                source_ports: vec![],
+                action: Action::Drop as i32,
+                rate_limit: 0,
+                burst_limit: 0,
+                stateful: false,
+                source_groups: vec![],
+                destination_groups: vec![],
+            };
             inbound_chain.rules.push(udp_rule);
+            inbound_chain.rules.push(udp_rule_deny_other);
         }
 
         if self.acl.is_none() {
@@ -1282,6 +1337,45 @@ mod tests {
         let result = processor.process_packet(&packet_info, ChainType::Inbound);
         assert_eq!(result.action, Action::Allow);
         assert_eq!(result.matched_rule, Some(RuleId::Priority(70)));
+    }
+
+    #[tokio::test]
+    async fn test_forward_acl_source_ip_whitelist() {
+        let mut acl_config = Acl::default();
+        let mut acl_v1 = AclV1::default();
+        let mut chain = Chain {
+            name: "subnet_proxy_protect".to_string(),
+            chain_type: ChainType::Forward as i32,
+            enabled: true,
+            default_action: Action::Drop as i32,
+            ..Default::default()
+        };
+
+        chain.rules.push(Rule {
+            name: "allow_my_devices".to_string(),
+            priority: 1000,
+            enabled: true,
+            action: Action::Allow as i32,
+            protocol: Protocol::Any as i32,
+            source_ips: vec!["10.172.192.2/32".to_string()],
+            ..Default::default()
+        });
+        acl_v1.chains.push(chain);
+        acl_config.acl_v1 = Some(acl_v1);
+
+        let processor = AclProcessor::new(acl_config);
+        let mut packet_info = create_test_packet_info();
+        packet_info.dst_ip = "192.168.1.10".parse().unwrap();
+
+        packet_info.src_ip = "10.172.192.2".parse().unwrap();
+        let result = processor.process_packet(&packet_info, ChainType::Forward);
+        assert_eq!(result.action, Action::Allow);
+        assert_eq!(result.matched_rule, Some(RuleId::Priority(1000)));
+
+        packet_info.src_ip = "10.172.192.3".parse().unwrap();
+        let result = processor.process_packet(&packet_info, ChainType::Forward);
+        assert_eq!(result.action, Action::Drop);
+        assert_eq!(result.matched_rule, Some(RuleId::Default));
     }
 
     fn create_test_acl_config() -> Acl {

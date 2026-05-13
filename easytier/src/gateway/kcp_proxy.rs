@@ -4,42 +4,34 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{Context, anyhow, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
+use guarden::defer;
 use kcp_sys::{
     endpoint::{ConnId, KcpEndpoint, KcpPacketReceiver},
     ffi_safe::KcpConfig,
     packet_def::KcpPacket,
     stream::KcpStream,
 };
-use pnet::packet::{
-    ip::IpNextHeaderProtocols,
-    ipv4::Ipv4Packet,
-    tcp::{TcpFlags, TcpPacket},
-    Packet as _,
-};
 use prost::Message;
-use tokio::{
-    io::{copy_bidirectional, AsyncRead, AsyncWrite},
-    select,
-    task::JoinSet,
-};
-use tokio_util::io::InspectReader;
+use tokio::task::JoinSet;
 
 use super::{
-    tcp_proxy::{NatDstConnector, NatDstTcpConnector, TcpProxy},
     CidrSet,
+    tcp_proxy::{NatDstConnector, NatDstTcpConnector, TcpProxy},
 };
+use crate::utils::task::HedgeExt;
 use crate::{
     common::{
         acl_processor::PacketInfo,
         error::Result,
         global_ctx::{ArcGlobalCtx, GlobalCtx},
     },
-    peers::{acl_filter::AclFilter, peer_manager::PeerManager, NicPacketFilter, PeerPacketFilter},
+    gateway::wrapped_proxy::{ProxyAclHandler, TcpProxyForWrappedSrcTrait},
+    peers::{PeerPacketFilter, peer_manager::PeerManager},
     proto::{
-        acl::{Action, ChainType, Protocol},
+        acl::{ChainType, Protocol},
         api::instance::{
             ListTcpProxyEntryRequest, ListTcpProxyEntryResponse, TcpProxyEntry, TcpProxyEntryState,
             TcpProxyEntryTransportType, TcpProxyRpc,
@@ -123,72 +115,57 @@ pub struct NatDstKcpConnector {
 impl NatDstConnector for NatDstKcpConnector {
     type DstStream = KcpStream;
 
-    async fn connect(&self, src: SocketAddr, nat_dst: SocketAddr) -> Result<Self::DstStream> {
+    async fn connect(
+        &self,
+        src: SocketAddr,
+        nat_dst: SocketAddr,
+    ) -> anyhow::Result<Self::DstStream> {
+        let peer_mgr = self
+            .peer_mgr
+            .upgrade()
+            .ok_or_else(|| anyhow!("peer manager is not available"))?;
+
+        let dst_peer = {
+            let SocketAddr::V4(addr) = nat_dst else {
+                bail!("ipv6 is not supported");
+            };
+            peer_mgr
+                .get_peer_map()
+                .get_peer_id_by_ipv4(addr.ip())
+                .await
+                .ok_or_else(|| anyhow!("no peer found for nat dst: {}", nat_dst))?
+        };
+
+        tracing::trace!(?nat_dst, ?dst_peer, "kcp nat");
+
         let conn_data = KcpConnData {
             src: Some(src.into()),
             dst: Some(nat_dst.into()),
         };
 
-        let Some(peer_mgr) = self.peer_mgr.upgrade() else {
-            return Err(anyhow::anyhow!("peer manager is not available").into());
-        };
+        let stream = (0..5)
+            .map(|_| {
+                let kcp_endpoint = self.kcp_endpoint.clone();
+                let my_peer_id = peer_mgr.my_peer_id();
 
-        let dst_peer_id = match nat_dst {
-            SocketAddr::V4(addr) => peer_mgr.get_peer_map().get_peer_id_by_ipv4(addr.ip()).await,
-            SocketAddr::V6(_) => return Err(anyhow::anyhow!("ipv6 is not supported").into()),
-        };
+                async move {
+                    let conn_id = kcp_endpoint
+                        .connect(
+                            Duration::from_secs(10),
+                            my_peer_id,
+                            dst_peer,
+                            Bytes::from(conn_data.encode_to_vec()),
+                        )
+                        .await?;
 
-        let Some(dst_peer) = dst_peer_id else {
-            return Err(anyhow::anyhow!("no peer found for nat dst: {}", nat_dst).into());
-        };
-
-        tracing::trace!("kcp nat dst: {:?}, dst peers: {:?}", nat_dst, dst_peer);
-
-        let mut connect_tasks: JoinSet<std::result::Result<ConnId, anyhow::Error>> = JoinSet::new();
-        let mut retry_remain = 5;
-        loop {
-            select! {
-                Some(Ok(Ok(ret))) = connect_tasks.join_next() => {
-                    // just wait for the previous connection to finish
-                    let stream = KcpStream::new(&self.kcp_endpoint, ret)
-                        .ok_or(anyhow::anyhow!("failed to create kcp stream"))?;
-                    return Ok(stream);
+                    KcpStream::new(&kcp_endpoint, conn_id).context("failed to create kcp stream")
                 }
-                _ = tokio::time::sleep(Duration::from_millis(200)), if !connect_tasks.is_empty() && retry_remain > 0 => {
-                    // no successful connection yet, trigger another connection attempt
-                }
-                else => {
-                    // got error in connect_tasks, continue to retry
-                    if retry_remain == 0 && connect_tasks.is_empty() {
-                        break;
-                    }
-                }
-            }
+            })
+            .hedge(Duration::from_millis(200))
+            .await
+            .context("failed to connect to peer")?;
 
-            // create a new connection task
-            if retry_remain == 0 {
-                continue;
-            }
-            retry_remain -= 1;
-
-            let kcp_endpoint = self.kcp_endpoint.clone();
-            let my_peer_id = peer_mgr.my_peer_id();
-            let conn_data_clone = conn_data;
-
-            connect_tasks.spawn(async move {
-                kcp_endpoint
-                    .connect(
-                        Duration::from_secs(10),
-                        my_peer_id,
-                        dst_peer,
-                        Bytes::from(conn_data_clone.encode_to_vec()),
-                    )
-                    .await
-                    .with_context(|| format!("failed to connect to nat dst: {}", nat_dst))
-            });
-        }
-
-        Err(anyhow::anyhow!("failed to connect to nat dst: {}", nat_dst).into())
+        Ok(stream)
     }
 
     fn check_packet_from_peer_fast(&self, _cidr_set: &CidrSet, _global_ctx: &GlobalCtx) -> bool {
@@ -200,7 +177,7 @@ impl NatDstConnector for NatDstKcpConnector {
         _cidr_set: &CidrSet,
         _global_ctx: &GlobalCtx,
         hdr: &PeerManagerHeader,
-        _ipv4: &Ipv4Packet,
+        _ipv4: &Ipv4Addr,
         _real_dst_ip: &mut Ipv4Addr,
     ) -> bool {
         hdr.from_peer_id == hdr.to_peer_id && hdr.is_kcp_src_modified()
@@ -215,100 +192,24 @@ impl NatDstConnector for NatDstKcpConnector {
 struct TcpProxyForKcpSrc(Arc<TcpProxy<NatDstKcpConnector>>);
 
 #[async_trait::async_trait]
-pub(crate) trait TcpProxyForKcpSrcTrait: Send + Sync + 'static {
-    type Connector: NatDstConnector;
-    fn get_tcp_proxy(&self) -> &Arc<TcpProxy<Self::Connector>>;
-    async fn check_dst_allow_kcp_input(&self, dst_ip: &Ipv4Addr) -> bool;
-}
-
-#[async_trait::async_trait]
-impl TcpProxyForKcpSrcTrait for TcpProxyForKcpSrc {
+impl TcpProxyForWrappedSrcTrait for TcpProxyForKcpSrc {
     type Connector = NatDstKcpConnector;
 
     fn get_tcp_proxy(&self) -> &Arc<TcpProxy<Self::Connector>> {
         &self.0
     }
 
-    async fn check_dst_allow_kcp_input(&self, dst_ip: &Ipv4Addr) -> bool {
-        self.0
-            .get_peer_manager()
+    fn mark_src_modified(hdr: &mut PeerManagerHeader) -> &mut PeerManagerHeader {
+        hdr.mark_kcp_src_modified()
+    }
+
+    async fn check_dst_allow_wrapped_input(&self, dst_ip: &Ipv4Addr) -> bool {
+        let Some(peer_manager) = self.0.get_peer_manager() else {
+            return false;
+        };
+        peer_manager
             .check_allow_kcp_to_dst(&IpAddr::V4(*dst_ip))
             .await
-    }
-}
-
-#[async_trait::async_trait]
-impl<C: NatDstConnector, T: TcpProxyForKcpSrcTrait<Connector = C>> NicPacketFilter for T {
-    async fn try_process_packet_from_nic(&self, zc_packet: &mut ZCPacket) -> bool {
-        let ret = self
-            .get_tcp_proxy()
-            .try_process_packet_from_nic(zc_packet)
-            .await;
-        if ret {
-            return true;
-        }
-
-        let data = zc_packet.payload();
-        let ip_packet = Ipv4Packet::new(data).unwrap();
-        if ip_packet.get_version() != 4
-            || ip_packet.get_next_level_protocol() != IpNextHeaderProtocols::Tcp
-        {
-            return false;
-        }
-
-        // if no connection is established, only allow SYN packet
-        let tcp_packet = TcpPacket::new(ip_packet.payload()).unwrap();
-        let is_syn = tcp_packet.get_flags() & TcpFlags::SYN != 0
-            && tcp_packet.get_flags() & TcpFlags::ACK == 0;
-        if is_syn {
-            // only check dst feature flag when SYN packet
-            if !self
-                .check_dst_allow_kcp_input(&ip_packet.get_destination())
-                .await
-            {
-                tracing::warn!(
-                    "{:?} proxy src: dst {} not allow kcp input",
-                    self.get_tcp_proxy().get_transport_type(),
-                    ip_packet.get_destination()
-                );
-                return false;
-            }
-        } else {
-            // if not syn packet, only allow established connection
-            if !self
-                .get_tcp_proxy()
-                .is_tcp_proxy_connection(SocketAddr::new(
-                    IpAddr::V4(ip_packet.get_source()),
-                    tcp_packet.get_source(),
-                ))
-            {
-                return false;
-            }
-        }
-
-        if let Some(my_ipv4) = self.get_tcp_proxy().get_global_ctx().get_ipv4() {
-            // this is a net-to-net packet, only allow it when smoltcp is enabled
-            // because the syn-ack packet will not be through and handled by the tun device when
-            // the source ip is in the local network
-            if ip_packet.get_source() != my_ipv4.address()
-                && !self.get_tcp_proxy().is_smoltcp_enabled()
-            {
-                tracing::warn!(
-                    "{:?} nat 2 nat packet, src: {} dst: {} not allow kcp input",
-                    self.get_tcp_proxy().get_transport_type(),
-                    ip_packet.get_source(),
-                    ip_packet.get_destination()
-                );
-                return false;
-            }
-        };
-
-        let hdr = zc_packet.mut_peer_manager_header().unwrap();
-        hdr.to_peer_id = self.get_tcp_proxy().get_my_peer_id().into();
-        if self.get_tcp_proxy().get_transport_type() == TcpProxyEntryTransportType::Kcp {
-            hdr.set_kcp_src_modified(true);
-        }
-        true
     }
 }
 
@@ -385,50 +286,6 @@ pub struct KcpProxyDst {
     tasks: JoinSet<()>,
 }
 
-#[derive(Clone)]
-pub struct ProxyAclHandler {
-    pub acl_filter: Arc<AclFilter>,
-    pub packet_info: PacketInfo,
-    pub chain_type: ChainType,
-}
-
-impl ProxyAclHandler {
-    pub fn handle_packet(&self, buf: &[u8]) -> Result<()> {
-        let mut packet_info = self.packet_info.clone();
-        packet_info.packet_size = buf.len();
-        let ret = self
-            .acl_filter
-            .get_processor()
-            .process_packet(&packet_info, self.chain_type);
-        self.acl_filter.handle_acl_result(
-            &ret,
-            &packet_info,
-            self.chain_type,
-            &self.acl_filter.get_processor(),
-        );
-        if !matches!(ret.action, Action::Allow) {
-            return Err(anyhow::anyhow!("acl denied").into());
-        }
-
-        Ok(())
-    }
-
-    pub async fn copy_bidirection_with_acl(
-        &self,
-        src: impl AsyncRead + AsyncWrite + Unpin,
-        mut dst: impl AsyncRead + AsyncWrite + Unpin,
-    ) -> Result<()> {
-        let (src_reader, src_writer) = tokio::io::split(src);
-        let src_reader = InspectReader::new(src_reader, |buf| {
-            let _ = self.handle_packet(buf);
-        });
-        let mut src = tokio::io::join(src_reader, src_writer);
-
-        copy_bidirectional(&mut src, &mut dst).await?;
-        Ok(())
-    }
-}
-
 impl KcpProxyDst {
     pub async fn new(peer_manager: Arc<PeerManager>) -> Self {
         let mut kcp_endpoint = create_kcp_endpoint();
@@ -489,8 +346,11 @@ impl KcpProxyDst {
                 transport_type: TcpProxyEntryTransportType::Kcp.into(),
             },
         );
-        crate::defer! {
+        defer! {
             proxy_entries.remove(&conn_id);
+            if proxy_entries.capacity() - proxy_entries.len() > 16 {
+                proxy_entries.shrink_to_fit();
+            }
         }
 
         let src_ip = src_socket.ip();
@@ -500,9 +360,15 @@ impl KcpProxyDst {
             route.get_peer_groups_by_ip(&dst_ip)
         );
 
-        let send_to_self =
-            Some(dst_socket.ip()) == global_ctx.get_ipv4().map(|ip| IpAddr::V4(ip.address()));
+        if global_ctx.should_deny_proxy(&dst_socket, false) {
+            return Err(anyhow::anyhow!(
+                "dst socket {:?} is in running listeners, ignore it",
+                dst_socket
+            )
+            .into());
+        }
 
+        let send_to_self = global_ctx.is_ip_local_virtual_ip(&dst_ip);
         if send_to_self && global_ctx.no_tun() {
             dst_socket = format!("127.0.0.1:{}", dst_socket.port()).parse().unwrap();
         }
@@ -548,7 +414,7 @@ impl KcpProxyDst {
 
     async fn run_accept_task(&mut self) {
         let kcp_endpoint = self.kcp_endpoint.clone();
-        let global_ctx = self.peer_manager.get_global_ctx().clone();
+        let global_ctx = self.peer_manager.get_global_ctx();
         let proxy_entries = self.proxy_entries.clone();
         let cidr_set = self.cidr_set.clone();
         let route = Arc::new(self.peer_manager.get_route());

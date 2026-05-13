@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use super::{cidr_to_subnet_mask, run_shell_cmd, Error, IfConfiguerTrait};
+use super::{Error, IfConfiguerTrait, cidr_to_subnet_mask, run_shell_cmd};
 use async_trait::async_trait;
 use cidr::{Ipv4Inet, Ipv6Inet};
 
@@ -53,8 +53,8 @@ impl IfConfiguerTrait for MacIfConfiger {
     ) -> Result<(), Error> {
         run_shell_cmd(
             format!(
-                "ifconfig {} {:?}/{:?} 10.8.8.8 up",
-                name, address, cidr_prefix,
+                "ifconfig {} {:?}/{:?} {:?} up",
+                name, address, cidr_prefix, address,
             )
             .as_str(),
         )
@@ -67,13 +67,10 @@ impl IfConfiguerTrait for MacIfConfiger {
     }
 
     async fn remove_ip(&self, name: &str, ip: Option<Ipv4Inet>) -> Result<(), Error> {
-        if ip.is_none() {
-            run_shell_cmd(format!("ifconfig {} inet delete", name).as_str()).await
+        if let Some(ip) = ip {
+            run_shell_cmd(format!("ifconfig {} inet {} delete", name, ip.address()).as_str()).await
         } else {
-            run_shell_cmd(
-                format!("ifconfig {} inet {} delete", name, ip.unwrap().address()).as_str(),
-            )
-            .await
+            run_shell_cmd(format!("ifconfig {} inet delete", name).as_str()).await
         }
     }
 

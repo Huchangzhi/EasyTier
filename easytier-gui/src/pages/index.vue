@@ -1,166 +1,282 @@
 <script setup lang="ts">
-import { appLogDir } from '@tauri-apps/api/path'
 
-import { getCurrentWindow } from '@tauri-apps/api/window'
-import { writeText } from '@tauri-apps/plugin-clipboard-manager'
 import { type } from '@tauri-apps/plugin-os'
-import { exit } from '@tauri-apps/plugin-process'
-import { open } from '@tauri-apps/plugin-shell'
-import TieredMenu from 'primevue/tieredmenu'
-import { useToast } from 'primevue/usetoast'
-import { NetworkTypes, Config, Status, Utils, I18nUtils, ConfigEditDialog } from 'easytier-frontend-lib'
 
-import { isAutostart, setLoggingLevel } from '~/composables/network'
+import { invoke } from '@tauri-apps/api/core'
+import { writeText } from '@tauri-apps/plugin-clipboard-manager'
+import { open } from '@tauri-apps/plugin-shell'
+import { exit } from '@tauri-apps/plugin-process'
+import { I18nUtils, RemoteManagement, Utils } from "easytier-frontend-lib"
+import type { MenuItem } from 'primevue/menuitem'
 import { useTray } from '~/composables/tray'
-import { getAutoLaunchStatusAsync as getAutoLaunchStatus, loadAutoLaunchStatusAsync } from '~/modules/auto_launch'
-import { getDockVisibilityStatus, loadDockVisibilityAsync } from '~/modules/dock_visibility'
+import { initMobileVpnService } from '~/composables/mobile_vpn'
+import { GUIRemoteClient } from '~/modules/api'
+
+import { useToast, useConfirm } from 'primevue'
+import { loadMode, saveMode, WebClientConfig, type Mode } from '~/composables/mode'
+import { saveLastNetworkInstanceId, loadLastNetworkInstanceId } from '~/composables/config'
+import ModeSwitcher from '~/components/ModeSwitcher.vue'
+import { getEasytierVersion, getServiceStatus } from '~/composables/backend'
 
 const { t, locale } = useI18n()
-const visible = ref(false)
+const confirm = useConfirm()
 const aboutVisible = ref(false)
-const tomlConfig = ref('')
+const modeDialogVisible = ref(false)
+const currentMode = ref<Mode>({ mode: 'normal' })
+const editingMode = ref<Mode>({ mode: 'normal' })
+const isModeSaving = ref(false)
+const manualDisconnect = ref(false)
+
+const configServerDialogVisible = ref(false)
+const configServerConnected = ref(false)
+
+async function openModeDialog() {
+  editingMode.value = JSON.parse(JSON.stringify(loadMode()))
+  modeDialogVisible.value = true
+}
+
+async function onModeSave() {
+  if (isModeSaving.value) {
+    return;
+  }
+  isModeSaving.value = true
+  try {
+    await initWithMode(editingMode.value);
+    modeDialogVisible.value = false
+  }
+  catch (e: any) {
+    toast.add({ severity: 'error', summary: t('error'), detail: e, life: 10000 })
+    console.error("Error switching mode", e, currentMode.value, editingMode.value)
+    await initWithMode(currentMode.value);
+  }
+  finally {
+    isModeSaving.value = false
+  }
+}
+
+async function onUninstallService() {
+  confirm.require({
+    message: t('mode.uninstall_service_confirm'),
+    header: t('mode.uninstall_service'),
+    icon: 'pi pi-exclamation-triangle',
+    rejectProps: {
+      label: t('web.common.cancel'),
+      severity: 'secondary',
+      outlined: true
+    },
+    acceptProps: {
+      label: t('mode.uninstall_service'),
+      severity: 'danger'
+    },
+    accept: async () => {
+      isModeSaving.value = true
+      try {
+        await initWithMode({ ...currentMode.value, mode: 'normal' });
+        await initService(undefined)
+        toast.add({ severity: 'success', summary: t('web.common.success'), detail: t('mode.uninstall_service_success'), life: 3000 })
+        modeDialogVisible.value = false
+      } catch (e: any) {
+        toast.add({ severity: 'error', summary: t('error'), detail: e, life: 10000 })
+        console.error("Error uninstalling service", e)
+      } finally {
+        isModeSaving.value = false
+      }
+    },
+  });
+}
+
+function stripModeMetadata(mode: Mode) {
+  if (mode.mode !== 'service') {
+    return mode
+  }
+
+  const serviceConfig = { ...mode }
+  delete serviceConfig.installed_core_version
+  return serviceConfig
+}
+
+function modeConfigChanged(next: Mode) {
+  return JSON.stringify(stripModeMetadata(next)) !== JSON.stringify(stripModeMetadata(currentMode.value))
+}
+
+async function onStopService() {
+  isModeSaving.value = true
+  manualDisconnect.value = true
+  try {
+    await setServiceStatus(false)
+    toast.add({ severity: 'success', summary: t('web.common.success'), detail: t('mode.stop_service_success'), life: 3000 })
+    modeDialogVisible.value = false
+  }
+  catch (e: any) {
+    toast.add({ severity: 'error', summary: t('error'), detail: e, life: 10000 })
+    console.error("Error stopping service", e)
+  }
+  finally {
+    isModeSaving.value = false
+  }
+}
+
+async function initWithMode(mode: Mode) {
+  const running_inst_ids = (await remoteClient.value.list_network_instance_ids().catch(() => undefined))?.running_inst_ids ?? []
+
+  if (currentMode.value.mode === 'service' && mode.mode !== 'service') {
+    let serviceStatus = await getServiceStatus()
+    if (serviceStatus === "Running") {
+      manualDisconnect.value = true
+      await setServiceStatus(false)
+      serviceStatus = await getServiceStatus()
+      for (let i = 0; i < 10; i++) { // macOS takes a while to stop the service
+        if (serviceStatus === "Stopped") {
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100))
+        serviceStatus = await getServiceStatus()
+      }
+    }
+    if (serviceStatus === "Stopped") {
+      await initService(undefined)
+    }
+  }
+
+  let url: string | undefined = undefined
+  let retrys = 1
+  switch (mode.mode) {
+    case 'remote':
+      if (!mode.remote_rpc_address) {
+        toast.add({ severity: 'error', summary: t('error'), detail: t('mode.remote_rpc_address_empty'), life: 10000 })
+        return initWithMode({ ...mode, mode: 'normal' });
+      }
+      url = mode.remote_rpc_address
+      break;
+    case 'service': {
+      if (!mode.config_dir || !mode.file_log_dir || !mode.file_log_level || !mode.rpc_portal) {
+        toast.add({ severity: 'error', summary: t('error'), detail: t('mode.service_config_empty'), life: 10000 })
+        return initWithMode({ ...mode, mode: 'normal' });
+      }
+      let serviceStatus = await getServiceStatus()
+      const coreVersion = await getEasytierVersion()
+      if (serviceStatus === "NotInstalled" || modeConfigChanged(mode) || mode.installed_core_version !== coreVersion) {
+        mode.config_server_url = mode.config_server_url || undefined
+        await initService({
+          config_dir: mode.config_dir,
+          file_log_dir: mode.file_log_dir,
+          file_log_level: mode.file_log_level,
+          rpc_portal: mode.rpc_portal,
+          config_server: mode.config_server_url,
+        })
+        mode.installed_core_version = coreVersion
+        serviceStatus = await getServiceStatus()
+      }
+      if (serviceStatus === "Stopped") {
+        await setServiceStatus(true)
+      }
+      url = "tcp://" + mode.rpc_portal.replace("0.0.0.0", "127.0.0.1")
+      retrys = 5
+      break;
+    }
+    case 'normal':
+      url = mode.rpc_portal;
+      break;
+  }
+  for (let i = 0; i < retrys; i++) {
+    try {
+      await connectRpcClient(mode.mode === 'normal', url)
+      break;
+    } catch (e) {
+      if (i === retrys - 1) {
+        const errMsg = e instanceof Error ? e.message : String(e)
+        toast.add({
+          severity: 'error',
+          summary: t('error'),
+          detail: t('mode.rpc_connection_failed', { error: errMsg }),
+          life: 1000,
+        })
+        throw e;
+      }
+      console.error("Error connecting rpc client, retrying...", e)
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+  }
+  await sendConfigs(running_inst_ids.map(Utils.UuidToStr))
+  if (mode.mode === 'normal') {
+    mode.config_server_url = mode.config_server_url || undefined
+    initWebClient(mode.config_server_url)
+  }
+  currentMode.value = mode
+  saveMode(mode)
+  clientRunning.value = await isClientRunning()
+}
+
+onMounted(async () => {
+  const cleanupFns: Array<() => void> = []
+
+  if (type() === 'android') {
+    try {
+      await initMobileVpnService()
+      console.error("easytier init vpn service done")
+    } catch (e: any) {
+      console.error("easytier init vpn service failed", e)
+    }
+  }
+
+  cleanupFns.push(await listenGlobalEvents())
+  currentMode.value = loadMode()
+  await initWithMode(currentMode.value);
+
+  onUnmounted(() => {
+    cleanupFns.forEach(unlisten => unlisten())
+  })
+});
 
 useTray(true)
+let toast = useToast();
 
-const items = ref([
-  {
-    label: () => activeStep.value == "2" ? t('show_config') : t('edit_config'),
-    icon: 'pi pi-file-edit',
-    command: async () => {
-      try {
-        const ret = await parseNetworkConfig(networkStore.curNetwork)
-        tomlConfig.value = ret
-      }
-      catch (e: any) {
-        tomlConfig.value = e
-      }
-      visible.value = true
-    },
-  },
-  {
-    label: () => t('del_cur_network'),
-    icon: 'pi pi-times',
-    command: async () => {
-      networkStore.removeNetworkInstance(networkStore.curNetwork.instance_id)
-      await retainNetworkInstance(networkStore.networkInstanceIds)
-      networkStore.delCurNetwork()
-    },
-    disabled: () => networkStore.networkList.length <= 1,
-  },
-])
+const remoteClient = computed(() => new GUIRemoteClient());
+const instanceId = ref<string | undefined>(undefined);
+const clientRunning = ref(false);
 
-enum Severity {
-  None = 'none',
-  Success = 'success',
-  Info = 'info',
-  Warn = 'warn',
-  Error = 'error',
-}
-
-const messageBarSeverity = ref(Severity.None)
-const messageBarContent = ref('')
-const toast = useToast()
-
-const networkStore = useNetworkStore()
-
-const curNetworkConfig = computed(() => {
-  if (networkStore.curNetworkId) {
-    // console.log('instanceId', props.instanceId)
-    const c = networkStore.networkList.find(n => n.instance_id === networkStore.curNetworkId)
-    if (c !== undefined)
-      return c
+watch(instanceId, (newVal) => {
+  if (newVal) {
+    saveLastNetworkInstanceId(newVal);
   }
+});
 
-  return networkStore.curNetwork
-})
-
-const curNetworkInst = computed<NetworkTypes.NetworkInstance | null>(() => {
-  let ret = networkStore.networkInstances.find(n => n.instance_id === curNetworkConfig.value.instance_id)
-  console.log('curNetworkInst', ret)
-  if (ret === undefined) {
-    return null;
-  } else {
-    return ret;
+watch(clientRunning, async (newVal, oldVal) => {
+  if (!newVal && oldVal) {
+    if (manualDisconnect.value) {
+      manualDisconnect.value = false
+      return
+    }
+    await reconnectClient()
+  } else if (newVal && !oldVal) {
+    const lastInstanceId = loadLastNetworkInstanceId();
+    if (lastInstanceId) {
+      instanceId.value = lastInstanceId;
+    }
   }
 })
 
-function addNewNetwork() {
-  networkStore.addNewNetwork()
-  networkStore.curNetwork = networkStore.lastNetwork
-}
-
-networkStore.$subscribe(async () => {
-  networkStore.saveToLocalStorage()
-  try {
-    await parseNetworkConfig(networkStore.curNetwork)
-    messageBarSeverity.value = Severity.None
-  }
-  catch (e: any) {
-    messageBarContent.value = e
-    messageBarSeverity.value = Severity.Error
-  }
-})
-
-async function runNetworkCb(cfg: NetworkTypes.NetworkConfig, cb: () => void) {
-  if (type() === 'android') {
-    await prepareVpnService(cfg.instance_id)
-    networkStore.clearNetworkInstances()
-  }
-  else {
-    networkStore.removeNetworkInstance(cfg.instance_id)
-  }
-
-  await retainNetworkInstance(networkStore.networkInstanceIds)
-  networkStore.addNetworkInstance(cfg.instance_id)
-
-  try {
-    await runNetworkInstance(cfg)
-    networkStore.addAutoStartInstId(cfg.instance_id)
-  }
-  catch (e: any) {
-    // console.error(e)
-    toast.add({ severity: 'info', detail: e })
-  }
-
-  cb()
-}
-
-async function setAsDefaultCb(cfg: NetworkTypes.NetworkConfig) {
-  // 保存默认网络ID到localStorage
-  localStorage.setItem('defaultNetworkId', cfg.instance_id);
-  toast.add({ severity: 'success', detail: t('network_set_as_default'), life: 3000 });
-
-  // 自动运行网络并切换到运行状态
-  if (!networkStore.networkInstanceIds.includes(cfg.instance_id)) {
-    await runNetworkCb(cfg, () => {
-      // 切换到运行状态面板
-    });
-  }
-}
-
-function unsetDefaultNetwork() {
-  localStorage.removeItem('defaultNetworkId');
-  toast.add({ severity: 'info', detail: t('default_network_unset'), life: 3000 });
-}
-
-async function stopNetworkCb(cfg: NetworkTypes.NetworkConfig, cb: () => void) {
-  // console.log('stopNetworkCb', cfg, cb)
-  cb()
-  networkStore.removeNetworkInstance(cfg.instance_id)
-  await retainNetworkInstance(networkStore.networkInstanceIds)
-  networkStore.removeAutoStartInstId(cfg.instance_id)
-}
-
-async function updateNetworkInfos() {
-  networkStore.updateWithNetworkInfos(await collectNetworkInfos())
-}
-
-let intervalId = 0
 onMounted(async () => {
-  intervalId = window.setInterval(async () => {
-    await updateNetworkInfos()
-  }, 500)
+  clientRunning.value = await isClientRunning().catch(() => false)
+  const timer = setInterval(async () => {
+    try {
+      clientRunning.value = await isClientRunning()
+    } catch (e) {
+      clientRunning.value = false
+      console.error("Error checking client running status", e)
+    }
+  }, 1000)
 
+  onUnmounted(() => {
+    clearInterval(timer)
+  })
+})
+async function reconnectClient() {
+  editingMode.value = JSON.parse(JSON.stringify(loadMode()));
+  await onModeSave()
+}
+
+onMounted(async () => {
   window.setTimeout(async () => {
     await setTrayMenu([
       await MenuItemShow(t('tray.show')),
@@ -168,21 +284,53 @@ onMounted(async () => {
     ])
   }, 1000)
 })
-onUnmounted(() => clearInterval(intervalId))
-
-const isDefaultNetwork = computed(() => {
-  const defaultNetworkId = localStorage.getItem('defaultNetworkId');
-  return defaultNetworkId === networkStore.curNetworkId;
-})
-
-const activeStep = computed(() => {
-  return networkStore.networkInstanceIds.includes(networkStore.curNetworkId) ? '2' : '1'
-})
 
 let current_log_level = 'off'
 
-const setting_menu = ref()
-const setting_menu_items = ref([
+const log_menu = ref()
+// 从后端获取正确的日志路径
+async function getLogDirPath(): Promise<string> {
+  return await invoke<string>('get_log_dir_path')
+}
+
+const log_menu_items_popup: Ref<MenuItem[]> = ref([
+  ...['off', 'warn', 'info', 'debug', 'trace'].map(level => ({
+    label: () => t(`logging_level_${level}`) + (current_log_level === level ? ' ✓' : ''),
+    command: async () => {
+      current_log_level = level
+      await setLoggingLevel(level)
+    },
+  })),
+  {
+    separator: true,
+  },
+  {
+    label: () => t('logging_open_dir'),
+    icon: 'pi pi-folder-open',
+    command: async () => {
+      // console.log('open log dir', await getLogDirPath())
+      await open(await getLogDirPath())
+    },
+    visible: () => type() !== 'android',
+  },
+  {
+    label: () => t('logging_copy_dir'),
+    icon: 'pi pi-tablet',
+    command: async () => {
+      await writeText(await getLogDirPath())
+    },
+  },
+])
+
+function toggle_log_menu(event: any) {
+  log_menu.value.toggle(event)
+}
+
+function getLabel(item: MenuItem) {
+  return typeof item.label === 'function' ? item.label() : item.label
+}
+
+const setting_menu_items: Ref<MenuItem[]> = ref([
   {
     label: () => t('exchange_language'),
     icon: 'pi pi-language',
@@ -195,55 +343,22 @@ const setting_menu_items = ref([
     },
   },
   {
-    label: () => getAutoLaunchStatus() ? t('disable_auto_launch') : t('enable_auto_launch'),
-    icon: 'pi pi-desktop',
-    command: async () => {
-      await loadAutoLaunchStatusAsync(!getAutoLaunchStatus())
-    },
+    label: () => `${t('mode.switch_mode')}: ${t('mode.' + currentMode.value.mode)}`,
+    icon: 'pi pi-sync',
+    command: openModeDialog,
+    visible: () => type() !== 'android',
   },
   {
-    label: () => getDockVisibilityStatus() ? t('hide_dock_icon') : t('show_dock_icon'),
-    icon: 'pi pi-eye-slash',
-    command: async () => {
-      await loadDockVisibilityAsync(!getDockVisibilityStatus())
-    },
-    visible: () => type() === 'macos',
+    label: () => `${t('config-server.title')}${t('config-server.' + configServerConnectionStatus.value)}`,
+    icon: 'pi pi-globe',
+    command: openConfigServerDialog,
+    visible: () => ["normal", "service"].includes(currentMode.value.mode),
   },
   {
+    key: 'logging_menu',
     label: () => t('logging'),
     icon: 'pi pi-file',
-    items: (function () {
-      const levels = ['off', 'warn', 'info', 'debug', 'trace']
-      const items = []
-      for (const level of levels) {
-        items.push({
-          label: () => t(`logging_level_${level}`) + (current_log_level === level ? ' ✓' : ''),
-          command: async () => {
-            current_log_level = level
-            await setLoggingLevel(level)
-          },
-        })
-      }
-      items.push({
-        separator: true,
-      })
-      items.push({
-        label: () => t('logging_open_dir'),
-        icon: 'pi pi-folder-open',
-        command: async () => {
-          // console.log('open log dir', await appLogDir())
-          await open(await appLogDir())
-        },
-      })
-      items.push({
-        label: () => t('logging_copy_dir'),
-        icon: 'pi pi-tablet',
-        command: async () => {
-          await writeText(await appLogDir())
-        },
-      })
-      return items
-    })(),
+    items: [], // Keep this to show it's a parent menu
   },
   {
     label: () => t('about.title'),
@@ -261,173 +376,122 @@ const setting_menu_items = ref([
   },
 ])
 
-function toggle_setting_menu(event: any) {
-  setting_menu.value.toggle(event)
+async function connectRpcClient(isNormalMode: boolean, url?: string) {
+  await initRpcConnection(isNormalMode, url)
+  console.log("easytier rpc connection established, isNormalMode: ", isNormalMode)
 }
 
-onBeforeMount(async () => {
-  networkStore.loadFromLocalStorage()
-  if (type() !== 'android' && getAutoLaunchStatus() && await isAutostart()) {
-    getCurrentWindow().hide()
-    const autoStartIds = networkStore.autoStartInstIds
-    for (const id of autoStartIds) {
-      const cfg = networkStore.networkList.find((item: NetworkTypes.NetworkConfig) => item.instance_id === id)
-      if (cfg) {
-        networkStore.addNetworkInstance(cfg.instance_id)
-        await runNetworkInstance(cfg)
-      }
-    }
+async function openConfigServerDialog() {
+  editingMode.value = JSON.parse(JSON.stringify(loadMode()))
+  configServerDialogVisible.value = true
+}
+async function onConfigServerSave() {
+  if (JSON.stringify(currentMode.value) === JSON.stringify(editingMode.value)) {
+    configServerDialogVisible.value = false
+    return;
   }
+  if (editingMode.value.mode === 'service') {
+    await new Promise<void>((resolve, reject) => {
+      confirm.require({
+        message: t('config-server.update_service_confirm'),
+        icon: 'pi pi-exclamation-triangle',
+        rejectProps: {
+          label: t('web.common.cancel'),
+          severity: 'secondary',
+          outlined: true
+        },
+        acceptProps: {
+          label: t('web.common.confirm'),
+        },
+        accept: async () => {
+          resolve()
+        },
+        reject: () => {
+          reject()
+        }
+      });
+    })
+  }
+  console.log("Saving config server url", (editingMode.value as WebClientConfig).config_server_url)
+  await onModeSave();
+  configServerDialogVisible.value = false
+}
+onMounted(() => {
+  const timer = setInterval(async () => {
+    if (currentMode.value.mode !== 'normal') return;
+    if (!currentMode.value.config_server_url) return;
+    configServerConnected.value = await isWebClientConnected();
+  }, 1000)
 
-  // 检查是否有默认网络需要启动
-  const defaultNetworkId = localStorage.getItem('defaultNetworkId');
-  if (defaultNetworkId && !networkStore.networkInstanceIds.includes(defaultNetworkId)) {
-    const defaultNetwork = networkStore.networkList.find((item: NetworkTypes.NetworkConfig) => item.instance_id === defaultNetworkId);
-    if (defaultNetwork) {
-      networkStore.addNetworkInstance(defaultNetwork.instance_id);
-      await runNetworkInstance(defaultNetwork);
-    }
+  onUnmounted(() => {
+    clearInterval(timer)
+  })
+})
+const configServerConnectionStatus = computed(() => {
+  if (currentMode.value.mode !== 'normal') {
+    return 'unknown'
   }
+  if (!currentMode.value.config_server_url) {
+    return 'disconnected'
+  }
+  return configServerConnected.value ? 'connected' : 'connecting'
 })
 
-onMounted(async () => {
-  if (type() === 'android') {
-    try {
-      await initMobileVpnService()
-      console.error("easytier init vpn service done")
-    } catch (e: any) {
-      console.error("easytier init vpn service failed", e)
-    }
-  }
-})
-
-function isRunning(id: string) {
-  return networkStore.networkInstanceIds.includes(id)
-}
-
-async function saveTomlConfig(tomlConfig: string) {
-  const config = await generateNetworkConfig(tomlConfig)
-  networkStore.replaceCurNetwork(config);
-  toast.add({ severity: 'success', detail: t('config_saved'), life: 3000 })
-  visible.value = false
-}
-</script>
-
-<script lang="ts">
 </script>
 
 <template>
   <div id="root" class="flex flex-col">
-    <ConfigEditDialog v-model:visible="visible" :cur-network="curNetworkConfig" :readonly="activeStep !== '1'"
-      :save-config="saveTomlConfig" :generate-config="parseNetworkConfig" />
-
     <Dialog v-model:visible="aboutVisible" modal :header="t('about.title')" :style="{ width: '70%' }">
       <About />
     </Dialog>
+    <Dialog v-model:visible="modeDialogVisible" modal :header="t('mode.switch_mode')" :style="{ width: '50vw' }">
+      <ModeSwitcher v-model="editingMode" @uninstall-service="onUninstallService" @stop-service="onStopService" />
+      <template #footer>
+        <Button :label="t('web.common.cancel')" icon="pi pi-times" @click="modeDialogVisible = false" text />
+        <Button :label="t('web.common.save')" icon="pi pi-save" @click="onModeSave" autofocus :loading="isModeSaving" />
+      </template>
+    </Dialog>
 
-    <div class="w-full">
-      <div class="flex items-center gap-4 p-4 h-20">
-        <!-- 网络按钮 -->
-        <div class="flex shrink-0 items-center">
-          <Button icon="pi pi-plus" severity="primary" :label="t('add_new_network')" class="hidden md:inline-flex"
-            @click="addNewNetwork" />
-          <Button icon="pi pi-plus" severity="primary" class="md:hidden px-6" @click="addNewNetwork" />
-        </div>
-
-        <!-- 网络选择 - 占据中间剩余空间 -->
-        <Select v-model="networkStore.curNetwork" :options="networkStore.networkList" :highlight-on-select="false"
-          :placeholder="t('select_network')" class="flex-1 h-full min-w-0">
-          <template #value="slotProps">
-            <div class="flex items-center content-center min-w-0">
-              <div class="mr-4 flex-col min-w-0 flex-1">
-                <span class="truncate block"> &nbsp; {{ slotProps.value.network_name }}</span>
-              </div>
-              <Tag class="my-auto leading-3 shrink-0"
-                :severity="isRunning(slotProps.value.instance_id) ? 'success' : 'info'"
-                :value="t(isRunning(slotProps.value.instance_id) ? 'network_running' : 'network_stopped')" />
-            </div>
-          </template>
-          <template #option="slotProps">
-            <div class="flex flex-col items-start content-center max-w-full">
-              <div class="flex items-center min-w-0 w-full">
-                <div class="mr-4 min-w-0 flex-1">
-                  <span class="truncate block">{{ t('network_name') }}: {{ slotProps.option.network_name }}</span>
-                </div>
-                <Tag class="my-auto leading-3 shrink-0"
-                  :severity="isRunning(slotProps.option.instance_id) ? 'success' : 'info'"
-                  :value="t(isRunning(slotProps.option.instance_id) ? 'network_running' : 'network_stopped')" />
-              </div>
-              <div v-if="slotProps.option.networking_method !== NetworkTypes.NetworkingMethod.Standalone"
-                class="max-w-full overflow-hidden text-ellipsis">
-                {{ slotProps.option.networking_method === NetworkTypes.NetworkingMethod.Manual
-                  ? slotProps.option.peer_urls.join(', ')
-                  : slotProps.option.public_server_url }}
-              </div>
-              <div
-                v-if="isRunning(slotProps.option.instance_id) && networkStore.instances[slotProps.option.instance_id].detail && (!!networkStore.instances[slotProps.option.instance_id].detail?.my_node_info.virtual_ipv4)">
-                {{
-                  Utils.ipv4InetToString(networkStore.instances[slotProps.option.instance_id].detail?.my_node_info.virtual_ipv4)
-                }}
-              </div>
-            </div>
-          </template>
-        </Select>
-
-        <!-- 设置按钮 -->
-        <div class="flex items-center shrink-0">
-          <Button icon="pi pi-cog" severity="secondary" aria-haspopup="true" :label="t('settings')"
-            class="hidden md:inline-flex" aria-controls="overlay_setting_menu" @click="toggle_setting_menu" />
-          <Button icon="pi pi-cog" severity="secondary" aria-haspopup="true" class="md:hidden px-6"
-            aria-controls="overlay_setting_menu" @click="toggle_setting_menu" />
-          <TieredMenu id="overlay_setting_menu" ref="setting_menu" :model="setting_menu_items" :popup="true" />
-        </div>
+    <Dialog v-model:visible="configServerDialogVisible" modal :header="t('config-server.title')"
+      :style="{ width: '50vw' }">
+      <div class="flex flex-col gap-3">
+        <label for="config-server-address">{{ t('config-server.address') }}</label>
+        <InputText id="config-server-address" v-model="(editingMode as WebClientConfig).config_server_url"
+          :placeholder="t('config-server.address_placeholder')" />
+        <small class="p-text-secondary whitespace-pre-wrap">{{ t('config-server.description') }}</small>
       </div>
+      <template #footer>
+        <Button :label="t('web.common.cancel')" icon="pi pi-times" @click="configServerDialogVisible = false" text />
+        <Button :label="t('web.common.save')" icon="pi pi-save" @click="onConfigServerSave" autofocus
+          :loading="isModeSaving" />
+      </template>
+    </Dialog>
+
+    <Menu ref="log_menu" :model="log_menu_items_popup" :popup="true" />
+
+    <RemoteManagement v-if="clientRunning" class="flex-1 overflow-y-auto" :api="remoteClient"
+      :pause-auto-refresh="isModeSaving" v-model:instance-id="instanceId" />
+    <div v-else class="empty-state flex-1 flex flex-col items-center py-12">
+      <i class="pi pi-server text-5xl text-secondary mb-4 opacity-50"></i>
+      <div class="text-xl text-center font-medium mb-3">{{ t('client.not_running') }}
+      </div>
+      <Button @click="reconnectClient" :loading="isModeSaving" :label="t('client.retry')" icon="pi pi-replay"
+        iconPos="left" />
     </div>
 
-    <Panel class="h-full overflow-y-auto">
-      <Stepper :value="activeStep">
-        <StepList value="1">
-          <Step value="1">
-            {{ t('config_network') }}
-          </Step>
-          <Step value="2">
-            {{ t('running') }}
-          </Step>
-        </StepList>
-        <StepPanels value="1">
-          <StepPanel v-slot="{ activateCallback = (s: string) => { } } = {}" value="1">
-            <Config :instance-id="networkStore.curNetworkId" :config-invalid="messageBarSeverity !== Severity.None"
-              :cur-network="curNetworkConfig" @run-network="runNetworkCb($event, () => activateCallback('2'))"
-              @set-as-default="setAsDefaultCb($event)" />
-          </StepPanel>
-          <StepPanel v-slot="{ activateCallback = (s: string) => { } } = {}" value="2">
-            <div class="flex flex-col relative">
-              <Status v-if="!isDefaultNetwork" :cur-network-inst="curNetworkInst" />
-              <div v-else class="text-center py-10">
-                <i class="pi pi-check-circle text-green-500 text-6xl mb-4"></i>
-                <h2 class="text-xl font-semibold">{{ t('network_running') }}</h2>
-                <p class="text-gray-500 mt-2">{{ t('default_network_running') }}</p>
-              </div>
-              <div class="absolute bottom-4 right-4" v-if="isDefaultNetwork">
-                <Button :label="t('unset_default')" icon="pi pi-star" severity="secondary"
-                  @click="unsetDefaultNetwork" />
-              </div>
-              <div class="flex pt-6 justify-center" v-if="!isDefaultNetwork">
-                <Button :label="t('stop_network')" severity="danger" icon="pi pi-arrow-left"
-                  @click="stopNetworkCb(networkStore.curNetwork, () => activateCallback('1'))" />
-              </div>
-            </div>
-          </StepPanel>
-        </StepPanels>
-      </Stepper>
-    </Panel>
-
-    <div>
-      <Menubar :model="items" breakpoint="300px" />
-      <InlineMessage v-if="messageBarSeverity !== Severity.None" class="absolute bottom-0 right-0" severity="error">
-        {{ messageBarContent }}
-      </InlineMessage>
-    </div>
+    <Menubar :model="setting_menu_items" breakpoint="795px">
+      <template #item="{ item, props }">
+        <a v-if="item.key === 'logging_menu'" v-bind="props.action" @click="toggle_log_menu">
+          <span :class="item.icon" />
+          <span class="p-menubar-item-label">{{ getLabel(item) }}</span>
+          <span class="pi pi-angle-down p-menubar-item-icon text-[9px]"></span>
+        </a>
+        <a v-else v-bind="props.action">
+          <span :class="item.icon" />
+          <span class="p-menubar-item-label">{{ getLabel(item) }}</span>
+        </a>
+      </template>
+    </Menubar>
   </div>
 </template>
 

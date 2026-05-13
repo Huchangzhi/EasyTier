@@ -7,22 +7,21 @@ use std::{
 use anyhow::Context as _;
 use dashmap::DashMap;
 use easytier::{
-    common::{
-        config::{ConfigLoader, NetworkIdentity, PeerConfig, TomlConfigLoader},
-        scoped_task::ScopedTask,
+    common::config::{
+        ConfigFileControl, ConfigLoader, NetworkIdentity, PeerConfig, TomlConfigLoader,
     },
-    defer,
     instance_manager::NetworkInstanceManager,
-    launcher::ConfigSource,
 };
+use guarden::defer;
 use serde::{Deserialize, Serialize};
 use sqlx::any;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::db::{
+    Db, HealthStatus,
     entity::shared_nodes,
     operations::{HealthOperations, NodeOperations},
-    Db, HealthStatus,
 };
 
 pub struct HealthCheckOneNode {
@@ -241,7 +240,7 @@ pub struct HealthChecker {
     db: Db,
     instance_mgr: Arc<NetworkInstanceManager>,
     inst_id_map: DashMap<i32, uuid::Uuid>,
-    node_tasks: DashMap<i32, ScopedTask<()>>,
+    node_tasks: DashMap<i32, AbortOnDropHandle<()>>,
     node_records: Arc<DashMap<i32, HealthyMemRecord>>,
     node_cfg: Arc<DashMap<i32, TomlConfigLoader>>,
 }
@@ -360,6 +359,7 @@ impl HealthChecker {
             )
             .parse()
             .with_context(|| "failed to parse peer uri")?,
+            peer_public_key: None,
         }]);
 
         let inst_id = inst_id.unwrap_or(uuid::Uuid::new_v4());
@@ -375,6 +375,7 @@ impl HealthChecker {
         flags.no_tun = true;
         flags.disable_p2p = true;
         flags.disable_udp_hole_punching = true;
+        flags.disable_tcp_hole_punching = true;
         cfg.set_flags(flags);
 
         Ok(cfg)
@@ -392,7 +393,7 @@ impl HealthChecker {
                 .delete_network_instance(vec![cfg.get_id()]);
         });
         self.instance_mgr
-            .run_network_instance(cfg.clone(), ConfigSource::FFI)
+            .run_network_instance(cfg.clone(), false, ConfigFileControl::STATIC_CONFIG)
             .with_context(|| "failed to run network instance")?;
 
         let now = Instant::now();
@@ -436,7 +437,7 @@ impl HealthChecker {
         );
 
         self.instance_mgr
-            .run_network_instance(cfg.clone(), ConfigSource::Web)
+            .run_network_instance(cfg.clone(), true, ConfigFileControl::STATIC_CONFIG)
             .with_context(|| "failed to run network instance")?;
         self.inst_id_map.insert(node_id, cfg.get_id());
 
@@ -464,7 +465,7 @@ impl HealthChecker {
         }
 
         // 启动健康检查任务
-        let task = ScopedTask::from(tokio::spawn(Self::node_health_check_task(
+        let task = AbortOnDropHandle::new(tokio::spawn(Self::node_health_check_task(
             node_id,
             cfg.get_id(),
             Arc::clone(&self.instance_mgr),

@@ -11,9 +11,8 @@ use tokio_stream::StreamExt;
 
 use crate::{
     common::{
-        join_joinset_background,
+        PeerId, join_joinset_background,
         stats_manager::{LabelSet, LabelType, MetricName, StatsManager},
-        PeerId,
     },
     proto::{
         common::{
@@ -24,16 +23,16 @@ use crate::{
         rpc_types::{controller::Controller, error::Result},
     },
     tunnel::{
+        Tunnel, ZCPacketStream,
         mpsc::{MpscTunnel, MpscTunnelSender},
         ring::create_ring_tunnel_pair,
-        Tunnel, ZCPacketStream,
     },
 };
 
 use super::{
-    packet::{build_rpc_packet, compress_packet, decompress_packet, PacketMerger},
-    service_registry::ServiceRegistry,
     RpcController, Transport,
+    packet::{PacketMerger, build_rpc_packet, compress_packet, decompress_packet},
+    service_registry::ServiceRegistry,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -82,16 +81,9 @@ impl Server {
         registry: Arc<ServiceRegistry>,
         stats_manager: Arc<StatsManager>,
     ) -> Self {
-        let (ring_a, ring_b) = create_ring_tunnel_pair();
-
-        Self {
-            registry,
-            mpsc: Mutex::new(Some(MpscTunnel::new(ring_a, None))),
-            transport: Mutex::new(MpscTunnel::new(ring_b, None)),
-            tasks: Arc::new(Mutex::new(JoinSet::new())),
-            packet_mergers: Arc::new(DashMap::new()),
-            stats_manager: Some(stats_manager),
-        }
+        let mut ret = Self::new_with_registry(registry);
+        ret.stats_manager = Some(stats_manager);
+        ret
     }
 
     pub fn registry(&self) -> &ServiceRegistry {
@@ -176,6 +168,7 @@ impl Server {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 packet_mergers.retain(|_, v| v.last_updated().elapsed().as_secs() < 10);
+                packet_mergers.shrink_to_fit();
             }
         });
     }
@@ -307,7 +300,6 @@ impl Server {
                 accepted_algo: CompressionAlgoPb::Zstd.into(),
             },
         });
-
         for packet in packets {
             if let Err(err) = sender.send(packet).await {
                 tracing::error!(?err, "Failed to send response packet");

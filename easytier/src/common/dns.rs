@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Context;
 use hickory_proto::runtime::TokioRuntimeProvider;
@@ -68,25 +68,19 @@ pub async fn socket_addrs(
     url: &url::Url,
     default_port_number: impl Fn() -> Option<u16>,
 ) -> Result<Vec<SocketAddr>, Error> {
-    let host = url.host_str().ok_or(Error::InvalidUrl(url.to_string()))?;
+    let host = url.host().ok_or(Error::InvalidUrl(url.to_string()))?;
     let port = url
         .port()
         .or_else(default_port_number)
         .ok_or(Error::InvalidUrl(url.to_string()))?;
-    // See https://github.com/EasyTier/EasyTier/pull/947
-    let port = match port {
-        0 => match url.scheme() {
-            "ws" => 80,
-            "wss" => 443,
-            _ => port,
-        },
-        _ => port,
-    };
 
     // if host is an ip address, return it directly
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Ok(vec![SocketAddr::new(ip, port)]);
+    match host {
+        url::Host::Ipv4(ip) => return Ok(vec![SocketAddr::new(std::net::IpAddr::V4(ip), port)]),
+        url::Host::Ipv6(ip) => return Ok(vec![SocketAddr::new(std::net::IpAddr::V6(ip), port)]),
+        _ => {}
     }
+    let host = host.to_string();
 
     if ALLOW_USE_SYSTEM_DNS_RESOLVER.load(std::sync::atomic::Ordering::Relaxed) {
         let socket_addr = format!("{}:{}", host, port);
@@ -103,7 +97,7 @@ pub async fn socket_addrs(
     }
 
     // use hickory_resolver
-    let ret = RESOLVER.lookup_ip(host).await.with_context(|| {
+    let ret = RESOLVER.lookup_ip(&host).await.with_context(|| {
         format!(
             "hickory dns lookup_ip failed, host: {}, port: {}",
             host, port
@@ -117,9 +111,8 @@ pub async fn socket_addrs(
 
 #[cfg(test)]
 mod tests {
-    use crate::defer;
-
     use super::*;
+    use guarden::defer;
 
     #[tokio::test]
     async fn test_socket_addrs() {
@@ -135,5 +128,24 @@ mod tests {
         let addrs = socket_addrs(&url, || Some(80)).await.unwrap();
         assert_eq!(2, addrs.len(), "addrs: {:?}", addrs);
         println!("addrs2: {:?}", addrs);
+    }
+
+    #[tokio::test]
+    async fn socket_addrs_preserves_explicit_zero_port() {
+        let cases = [
+            ("ws://127.0.0.1:0", 80, 0),
+            ("wss://127.0.0.1:0", 443, 0),
+            ("ws://127.0.0.1", 80, 80),
+            ("wss://127.0.0.1", 443, 443),
+        ];
+
+        for (raw_url, default_port, expected_port) in cases {
+            let url = url::Url::parse(raw_url).unwrap();
+            let addrs = socket_addrs(&url, || Some(default_port)).await.unwrap();
+            assert_eq!(
+                addrs,
+                vec![SocketAddr::from(([127, 0, 0, 1], expected_port))]
+            );
+        }
     }
 }

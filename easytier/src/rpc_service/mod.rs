@@ -1,18 +1,22 @@
 mod acl_manage;
-mod api;
 mod config;
 mod connector_manage;
+mod credential_manage;
 mod mapped_listener_manage;
+mod peer_center;
 mod peer_manage;
 mod port_forward_manage;
+pub(crate) mod protected_port;
 mod proxy;
 mod stats;
 mod vpn_portal;
 
+pub mod api;
 pub mod instance_manage;
 pub mod logger;
+pub mod remote_client;
 
-pub type ApiRpcServer = self::api::ApiRpcServer;
+pub type ApiRpcServer<T> = self::api::ApiRpcServer<T>;
 
 pub trait InstanceRpcService: Sync + Send {
     fn get_peer_manage_service(
@@ -66,6 +70,19 @@ pub trait InstanceRpcService: Sync + Send {
     ) -> &dyn crate::proto::api::config::ConfigRpc<
         Controller = crate::proto::rpc_types::controller::BaseController,
     >;
+    fn get_peer_center_service(
+        &self,
+    ) -> std::sync::Arc<
+        dyn crate::proto::peer_rpc::PeerCenterRpc<
+                Controller = crate::proto::rpc_types::controller::BaseController,
+            > + Send
+            + Sync,
+    >;
+    fn get_credential_manage_service(
+        &self,
+    ) -> &dyn crate::proto::api::instance::CredentialManageRpc<
+        Controller = crate::proto::rpc_types::controller::BaseController,
+    >;
 }
 
 fn get_instance_service(
@@ -78,18 +95,21 @@ fn get_instance_service(
     let id = if let Some(api::instance::instance_identifier::Selector::Id(id)) = selector {
         (*id).into()
     } else {
-        let ids = instance_manager.filter_network_instance(|_, i| {
-            if let Some(api::instance::instance_identifier::Selector::InstanceSelector(selector)) =
-                selector
-            {
-                if let Some(name) = selector.name.as_ref() {
-                    if i.get_inst_name() != *name {
-                        return false;
-                    }
+        let ids = instance_manager
+            .iter()
+            .filter(|v| {
+                if let Some(api::instance::instance_identifier::Selector::InstanceSelector(
+                    selector,
+                )) = selector
+                    && let Some(name) = selector.name.as_ref()
+                    && v.get_inst_name() != *name
+                {
+                    return false;
                 }
-            }
-            true
-        });
+                true
+            })
+            .map(|v| *v.key())
+            .collect::<Vec<_>>();
         match ids.len() {
             0 => return Err(anyhow::anyhow!("No instance matches the selector")),
             1 => ids[0],
@@ -97,7 +117,7 @@ fn get_instance_service(
                 return Err(anyhow::anyhow!(
                     "{} instances match the selector, please specify the instance ID",
                     ids.len()
-                ))
+                ));
             }
         }
     };
